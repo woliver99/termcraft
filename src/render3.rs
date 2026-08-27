@@ -115,13 +115,19 @@ impl<'a> Scene<'a> {
     /// Casts one ray and returns the final pixel color.
     fn cast(&self, o: (f32, f32, f32), d: (f32, f32, f32)) -> Rgb {
         let w = &self.g.world;
-        let (mut ix, mut iy, mut iz) = (
-            o.0.floor() as i32,
-            o.1.floor() as i32,
-            o.2.floor() as i32,
+        let (mut ix, mut iy, mut iz) = (o.0.floor() as i32, o.1.floor() as i32, o.2.floor() as i32);
+        let step = (
+            d.0.signum() as i32,
+            d.1.signum() as i32,
+            d.2.signum() as i32,
         );
-        let step = (d.0.signum() as i32, d.1.signum() as i32, d.2.signum() as i32);
-        let inv = |v: f32| if v != 0.0 { (1.0 / v).abs() } else { f32::INFINITY };
+        let inv = |v: f32| {
+            if v != 0.0 {
+                (1.0 / v).abs()
+            } else {
+                f32::INFINITY
+            }
+        };
         let t_delta = (inv(d.0), inv(d.1), inv(d.2));
         let frac = |o: f32, d: f32, i: i32| -> f32 {
             if d > 0.0 {
@@ -233,11 +239,7 @@ pub fn draw(f: &mut Frame, g: &mut Game3) {
         .torches
         .iter()
         .filter(|&&(x, y, z)| {
-            let (dx, dy, dz) = (
-                x as f32 - eye.0,
-                y as f32 - eye.1,
-                z as f32 - eye.2,
-            );
+            let (dx, dy, dz) = (x as f32 - eye.0, y as f32 - eye.1, z as f32 - eye.2);
             dx * dx + dy * dy + dz * dz < (MAX_DIST + TORCH_RADIUS3).powi(2)
         })
         .map(|&(x, y, z)| (x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5))
@@ -315,11 +317,12 @@ pub fn draw(f: &mut Frame, g: &mut Game3) {
     let (ccx, ccy) = (view.x + view.width / 2, view.y + view.height / 2);
     let on_peer = g.peer_in_crosshair().is_some();
     if let Some(cell) = buf.cell_mut((ccx, ccy)) {
-        cell.set_char(if on_peer { '✕' } else { '┼' }).set_fg(if on_peer {
-            Color::Rgb(255, 90, 90)
-        } else {
-            Color::White
-        });
+        cell.set_char(if on_peer { '✕' } else { '┼' })
+            .set_fg(if on_peer {
+                Color::Rgb(255, 90, 90)
+            } else {
+                Color::White
+            });
     }
 
     draw_nametags(
@@ -344,32 +347,55 @@ pub fn draw(f: &mut Frame, g: &mut Game3) {
         draw_crafting(f, g, area);
     }
     if g.help_open {
-        draw_help(
-            f,
-            area,
+        // Creative rewrites the movement bindings; keep survival text otherwise.
+        let movement: &[(&str, &str)] = if g.creative {
+            &[
+                ("Movement", ""),
+                ("  w / a / s / d", "fly where you look (includes pitch)"),
+                ("  arrow keys", "look around (or drag the mouse)"),
+                ("  space", "rise (hold to keep rising)"),
+                ("  f", "descend (hold to keep descending)"),
+            ]
+        } else {
             &[
                 ("Movement", ""),
                 ("  w / a / s / d", "move (relative to where you look)"),
                 ("  arrow keys", "look around (or drag the mouse)"),
                 ("  space", "jump / swim up (hold to keep jumping)"),
-                ("Actions", ""),
-                ("  x / Enter / left-click", "mine the block under the crosshair"),
-                ("  z / right-click", "place selected block on targeted face"),
-                ("  1-9", "select hotbar slot"),
-                ("  c", "crafting menu"),
-                ("Multiplayer", ""),
-                ("  --seed <N>", "same seed = same shared world"),
-                ("  t", "chat with everyone in the world"),
-                ("  Tab", "who's online"),
-                ("  x on a player", "punch them"),
-                ("Game", ""),
-                ("  F5 / Ctrl+S", "save"),
-                ("  h / ?", "toggle this help"),
-                ("  q / Esc", "quit (autosaves)"),
-                ("", ""),
-                ("Tip", "craft torches before nightfall - caves are dark!"),
-            ],
-        );
+            ]
+        };
+        let rest: &[(&str, &str)] = &[
+            ("Actions", ""),
+            (
+                "  x / Enter / left-click",
+                "mine the block under the crosshair",
+            ),
+            ("  z / right-click", "place selected block on targeted face"),
+            ("  1-9", "select hotbar slot"),
+            ("  c", "crafting menu"),
+            ("Multiplayer", ""),
+            ("  --seed <N>", "same seed = same shared world"),
+            ("  t", "chat with everyone in the world"),
+            ("  Tab", "who's online"),
+            ("  x on a player", "punch them"),
+            ("Game", ""),
+            ("  F5 / Ctrl+S", "save"),
+            ("  h / ?", "toggle this help"),
+            ("  q / Esc", "quit (autosaves)"),
+            ("", ""),
+            (
+                "Tip",
+                if g.creative {
+                    "creative: no gravity or fall damage - still collides with blocks"
+                } else {
+                    "craft torches before nightfall - caves are dark!"
+                },
+            ),
+        ];
+        let mut entries = Vec::with_capacity(movement.len() + rest.len());
+        entries.extend_from_slice(movement);
+        entries.extend_from_slice(rest);
+        draw_help(f, area, &entries);
     }
     if g.game_over {
         draw_game_over(f, area);
@@ -420,8 +446,8 @@ fn draw_nametags(f: &mut Frame, g: &Game3, view: Rect, b: Basis) {
         if !(0.0..pw).contains(&sx) || !(0.0..ph).contains(&sy) {
             continue;
         }
-        let hearts = (p.st.hp.clamp(0, PLAYER_MAX_HP) as f32 / PLAYER_MAX_HP as f32 * 5.0).round()
-            as usize;
+        let hearts =
+            (p.st.hp.clamp(0, PLAYER_MAX_HP) as f32 / PLAYER_MAX_HP as f32 * 5.0).round() as usize;
         let label = format!(
             "{} {}{}",
             p.name,
@@ -433,12 +459,7 @@ fn draw_nametags(f: &mut Frame, g: &Game3, view: Rect, b: Basis) {
         let row = (sy as u16 / 2).min(view.height.saturating_sub(1));
         let col = col.min(view.width.saturating_sub(width.min(view.width)));
         let c = p.tint();
-        let rect = Rect::new(
-            view.x + col,
-            view.y + row,
-            width.min(view.width - col),
-            1,
-        );
+        let rect = Rect::new(view.x + col, view.y + row, width.min(view.width - col), 1);
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 label,
@@ -504,7 +525,8 @@ fn draw_players(f: &mut Frame, g: &Game3, area: Rect) {
         ),
     ])];
     for p in g.peers.values() {
-        let d = ((p.st.x - g.px).powi(2) + (p.st.y - g.py).powi(2) + (p.st.z - g.pz).powi(2)).sqrt();
+        let d =
+            ((p.st.x - g.px).powi(2) + (p.st.y - g.py).powi(2) + (p.st.z - g.pz).powi(2)).sqrt();
         let c = p.tint();
         lines.push(Line::from(vec![
             Span::styled(
@@ -613,6 +635,15 @@ fn draw_hud(f: &mut Frame, g: &Game3, area: Rect, hud_h: u16) {
             Style::default().fg(Color::Rgb(200, 200, 255)),
         ),
     ];
+    if g.creative {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            "✈ creative",
+            Style::default()
+                .fg(Color::Rgb(160, 210, 255))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some(badge) = g.net_badge() {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
@@ -690,7 +721,13 @@ fn draw_hud(f: &mut Frame, g: &Game3, area: Rect, hud_h: u16) {
         return;
     }
 
-    let help = if g.is_multiplayer() {
+    let help = if g.creative {
+        if g.is_multiplayer() {
+            "h help  w/a/s/d fly  space up  f down  x mine  z place  c craft  t chat  Tab players  q quit"
+        } else {
+            "h help  w/a/s/d fly  ←↑→↓ look  space up  f down  x mine  z place  c craft  q quit"
+        }
+    } else if g.is_multiplayer() {
         "h help  w/a/s/d move  x mine  z place  c craft  t chat  Tab players  q quit"
     } else {
         "h help  w/a/s/d move  ←↑→↓ look  space jump  x mine  z place  c craft  q quit"
@@ -730,7 +767,9 @@ fn draw_crafting(f: &mut Frame, g: &Game3, area: Rect) {
             Style::default().fg(Color::Rgb(110, 110, 110))
         };
         let style = if sel {
-            style.add_modifier(Modifier::BOLD).bg(Color::Rgb(50, 50, 60))
+            style
+                .add_modifier(Modifier::BOLD)
+                .bg(Color::Rgb(50, 50, 60))
         } else {
             style
         };
@@ -923,6 +962,9 @@ mod tests {
                 }
             }
         }
-        assert!(diffs > 200, "view barely changed when pitching down ({diffs} px)");
+        assert!(
+            diffs > 200,
+            "view barely changed when pitching down ({diffs} px)"
+        );
     }
 }
