@@ -6,14 +6,14 @@ triggers:
         labels:
             - factory:termcraft
         repos:
-            - <your-username>/termcraft
+            - vikvang/termcraft
     - provider: github
       event: pull_request_closed
       filter:
         labels:
             - factory:termcraft
         repos:
-            - <your-username>/termcraft
+            - vikvang/termcraft
 ---
 You are the factory foreman handling a GitHub pull request closed or merged automation.
 

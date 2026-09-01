@@ -6,7 +6,7 @@ triggers:
       labels:
         - plan-approved
       repos:
-        - <your-username>/termcraft
+        - vikvang/termcraft
 ---
 A maintainer applied the `plan-approved` label to a pull request. This marks the spec in that PR as approved.
 

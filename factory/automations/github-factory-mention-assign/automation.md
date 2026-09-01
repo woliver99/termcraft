@@ -6,28 +6,28 @@ triggers:
       mentioned:
         - warp-factories
       repos:
-        - <your-username>/termcraft
+        - vikvang/termcraft
   - provider: github
     event: pull_request_mentioned
     filter:
       mentioned:
         - warp-factories
       repos:
-        - <your-username>/termcraft
+        - vikvang/termcraft
   - provider: github
     event: issue_assigned
     filter:
       assignees:
         - warp-factories
       repos:
-        - <your-username>/termcraft
+        - vikvang/termcraft
   - provider: github
     event: pull_request_assigned
     filter:
       assignees:
         - warp-factories
       repos:
-        - <your-username>/termcraft
+        - vikvang/termcraft
 ---
 The factory was mentioned on, or assigned to, an issue or pull request.
 

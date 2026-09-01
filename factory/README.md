@@ -28,11 +28,11 @@ mkdir -p factory
 curl -L https://github.com/warpdotdev/warp-factories-for-oss/tarball/main \
   | tar xz --strip-components=2 -C factory '*/default'   # GNU tar: add --wildcards
 ```
-The tree is placeholder-parameterized on three strings — `<your-username>/termcraft` (the target repo), `termcraft` (the factory alias, used in the `factory:<alias>` label), and `warp-factories` (the bot login shown after the GitHub App installs). Replace them everywhere in one pass:
+The tree is placeholder-parameterized on three strings — `vikvang/termcraft` (the target repo), `termcraft` (the factory alias, used in the `factory:<alias>` label), and `warp-factories` (the bot login shown after the GitHub App installs). Replace them everywhere in one pass:
 ```sh
 cd factory
 LC_ALL=C find . -type f -exec sed -i '' \
-  -e 's#<your-username>/termcraft#my-org/my-repo#g' \
+  -e 's#vikvang/termcraft#my-org/my-repo#g' \
   -e 's#your-org#my-org#g' -e 's#your-repo#my-repo#g' \
   -e 's#termcraft#my-alias#g' \
   -e 's#warp-factories#my-bot-login#g' {} +   # GNU sed: drop the '' after -i

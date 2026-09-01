@@ -6,12 +6,12 @@ triggers:
       labels:
         - factory-review
       repos:
-        - <your-username>/termcraft
+        - vikvang/termcraft
   - provider: github
     event: pull_request_review_requested
     filter:
       repos:
-        - <your-username>/termcraft
+        - vikvang/termcraft
 ---
 Someone explicitly requested a factory review on this pull request — via the `factory-review` label or a review request addressed to the factory's account.
 

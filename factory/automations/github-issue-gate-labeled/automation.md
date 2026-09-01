@@ -7,7 +7,7 @@ triggers:
         - ready-to-spec
         - ready-to-implement
       repos:
-        - <your-username>/termcraft
+        - vikvang/termcraft
 ---
 A maintainer applied a human gate label (`ready-to-spec` or `ready-to-implement`) to an issue.
 

@@ -4,17 +4,17 @@ triggers:
     event: pull_request_opened
     filter:
       repos:
-        - <your-username>/termcraft
+        - vikvang/termcraft
   - provider: github
     event: pull_request_reopened
     filter:
       repos:
-        - <your-username>/termcraft
+        - vikvang/termcraft
   - provider: github
     event: pull_request_ready
     filter:
       repos:
-        - <your-username>/termcraft
+        - vikvang/termcraft
 ---
 A pull request was opened, reopened, or marked ready for review. Run the review stage for it.
 

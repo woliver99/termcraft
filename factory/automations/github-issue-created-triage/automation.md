@@ -4,7 +4,7 @@ triggers:
     event: issue_created
     filter:
       repos:
-        - <your-username>/termcraft
+        - vikvang/termcraft
 ---
 A new issue was opened. Run the triage stage for it.
 
