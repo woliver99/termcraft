@@ -1,0 +1,5 @@
+platform:
+    os: linux
+    arch: x86_64
+    linux:
+        dockerImage: ubuntu:24.04  # replace with an image carrying your repo's toolchain

@@ -1,0 +1,15 @@
+schemaVersion: v1alpha1
+# Rename these for your deployment. The alias is used in the
+# factory:<alias> GitHub label that marks factory-owned issues and PRs.
+name: OSS Factory
+alias: termcraft
+credentialStrategy: EXECUTOR
+# The repositories this factory operates on. Keep every automation's
+# repos: filter in automations/ in sync with this list.
+repositories:
+    - owner: vikvang
+      name: termcraft
+integrations: []
+agentDefaults:
+    model: gpt-5-6-sol-medium
+    runner: default
