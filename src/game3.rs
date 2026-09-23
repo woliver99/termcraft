@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
+use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -10,6 +13,12 @@ use crate::block::Block;
 use crate::game::{KeyHold, DAY_LEN, PLAYER_MAX_HP, RECIPES};
 use crate::net::{Net, NetEvent, Peer, PlayerId, PlayerState, Role};
 use crate::world3::{World3, H3};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MigrationResult {
+    BecameHost,
+    Reconnected,
+}
 
 pub const REACH3: f32 = 5.0;
 pub const EYE_HEIGHT: f32 = 1.62;
@@ -359,11 +368,11 @@ impl Game3 {
     /// name, which is what other people see.
     pub fn attach_net(&mut self, net: Net) {
         self.name = net.name().to_string();
-        let (role, addr, seed) = (net.role(), net.addr(), self.seed);
+        let (role, addr) = (net.role(), net.addr());
         self.net = Some(net);
         let m = match role {
-            Role::Host => format!("Hosting seed {seed} on {addr} as {}.", self.name),
-            Role::Client => format!("Joined seed {seed} at {addr} as {}.", self.name),
+            Role::Host => format!("Hosting on {addr} as {}.", self.name),
+            Role::Client => format!("Joined at {addr} as {}.", self.name),
         };
         self.log_chat("*", &m);
         self.say(&m);
@@ -533,31 +542,87 @@ impl Game3 {
         self.peers
             .retain(|_, p| now.saturating_sub(p.last_seen) < PEER_TIMEOUT);
 
-        let st = PlayerState {
-            x: self.px,
-            y: self.py,
-            z: self.pz,
-            yaw: self.yaw,
-            pitch: self.pitch,
-            hp: self.hp,
-        };
-        if st != self.last_sent || self.time.is_multiple_of(STATE_HEARTBEAT) {
-            net.send_state(st);
-            self.last_sent = st;
-        }
-        if net.is_authority() && self.time.is_multiple_of(TIME_SYNC_EVERY) {
-            net.send_time(self.time);
+        if dropped.is_none() {
+            let st = PlayerState {
+                x: self.px,
+                y: self.py,
+                z: self.pz,
+                yaw: self.yaw,
+                pitch: self.pitch,
+                hp: self.hp,
+            };
+            if st != self.last_sent || self.time.is_multiple_of(STATE_HEARTBEAT) {
+                net.send_state(st);
+                self.last_sent = st;
+            }
+            if net.is_authority() && self.time.is_multiple_of(TIME_SYNC_EVERY) {
+                net.send_time(self.time);
+            }
         }
 
         match dropped {
             Some(why) => {
-                self.peers.clear();
-                let m = format!("Multiplayer ended: {why}. Playing solo.");
-                self.log_chat("*", &m);
-                self.say(&m);
+                drop(net);
+                match self.try_host_migration() {
+                    Ok(MigrationResult::BecameHost) => {
+                        let m = "Host left. You are now the host!";
+                        self.log_chat("*", m);
+                        self.say(m);
+                    }
+                    Ok(MigrationResult::Reconnected) => {
+                        let m = "Host migrated. Reconnected to new host!";
+                        self.log_chat("*", m);
+                        self.say(m);
+                    }
+                    Err(_) => {
+                        self.peers.clear();
+                        let m = format!("Multiplayer ended: {why}. Playing solo.");
+                        self.log_chat("*", &m);
+                        self.say(&m);
+                        self.net = None;
+                    }
+                }
             }
             None => self.net = Some(net),
         }
+    }
+
+    /// When the host disconnects, attempts to claim the host port or reconnect to
+    /// whichever other client successfully became host.
+    pub fn try_host_migration(&mut self) -> Result<MigrationResult, String> {
+        let port = crate::net::port_for_seed(self.seed);
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+
+        for _ in 0..10 {
+            // First: try to claim the rendezvous port and become host
+            if let Ok(listener) = TcpListener::bind(addr) {
+                let net = Net::host_from_listener(self.seed, self.name.clone(), addr, listener)
+                    .map_err(|e| e.to_string())?;
+                self.owns_save = true;
+                self.save_path = seed_save_path(self.seed);
+                self.peers.clear();
+                self.last_sent = PlayerState::default();
+                let _ = self.save();
+                self.net = Some(net);
+                return Ok(MigrationResult::BecameHost);
+            }
+
+            // Bind failed (e.g. AddrInUse) - another client may be hosting.
+            // Wait briefly for their accept thread to start.
+            thread::sleep(Duration::from_millis(80));
+
+            if let Ok(net) = Net::reconnect_client(self.seed, self.name.clone(), addr) {
+                self.owns_save = false;
+                self.peers.clear();
+                self.last_sent = PlayerState::default();
+                self.net = Some(net);
+                return Ok(MigrationResult::Reconnected);
+            }
+
+            thread::sleep(Duration::from_millis(40));
+        }
+
+        Err("Could not migrate host or reconnect".into())
     }
 
     // ------------------------------------------------------------- inventory
@@ -903,7 +968,7 @@ impl Game3 {
                     self.chat_open = true;
                     self.chat_input.clear();
                 } else {
-                    self.say("Chat needs a multiplayer world (--seed <N>).");
+                    self.say("Chat needs a multiplayer world.");
                 }
             }
             KeyCode::Tab => self.players_open = !self.players_open,
@@ -1132,7 +1197,13 @@ impl Game3 {
             std::fs::create_dir_all(dir)?;
         }
         let json = serde_json::to_string(&data)?;
-        std::fs::write(&path, json)
+        std::fs::write(&path, json)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
+        }
+        Ok(())
     }
 
     pub fn load_player(&mut self) -> bool {
@@ -1195,7 +1266,13 @@ impl Game3 {
             std::fs::create_dir_all(dir)?;
         }
         let json = serde_json::to_string(&data)?;
-        std::fs::write(&self.save_path, json)
+        std::fs::write(&self.save_path, json)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.save_path, std::fs::Permissions::from_mode(0o666));
+        }
+        Ok(())
     }
 
     pub fn load() -> Option<Game3> {
@@ -1257,6 +1334,14 @@ pub fn save3_path() -> PathBuf {
 /// Worlds played with an explicit seed get their own file, so a shared seed
 /// keeps everyone's buildings between sessions.
 pub fn seed_save_path(seed: u64) -> PathBuf {
+    if let Ok(party_dir) = std::env::var("PARTY_DIR") {
+        let p = party_dir.trim();
+        if !p.is_empty() {
+            let path = PathBuf::from(p);
+            let _ = std::fs::create_dir_all(&path);
+            return path.join(format!("world-{seed}.json"));
+        }
+    }
     crate::game::home_dir()
         .join(".termcraft")
         .join(format!("world-{seed}.json"))
@@ -1275,6 +1360,14 @@ pub struct PlayerSave {
 
 pub fn player_save_path(seed: u64, name: &str) -> PathBuf {
     let clean_name = crate::net::sanitize_name(name);
+    if let Ok(party_dir) = std::env::var("PARTY_DIR") {
+        let p = party_dir.trim();
+        if !p.is_empty() {
+            let path = PathBuf::from(p);
+            let _ = std::fs::create_dir_all(&path);
+            return path.join(format!("player-{seed}-{clean_name}.json"));
+        }
+    }
     crate::game::home_dir()
         .join(".termcraft")
         .join(format!("player-{seed}-{clean_name}.json"))
@@ -1314,6 +1407,28 @@ mod tests {
 
         let path = player_save_path(42, "test_player");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn shared_world_uses_party_dir_and_persists() {
+        let temp_dir = std::env::temp_dir().join(format!("termcraft-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        std::env::set_var("PARTY_DIR", &temp_dir);
+
+        let path = seed_save_path(99);
+        assert_eq!(path, temp_dir.join("world-99.json"));
+
+        let mut g = Game3::new(99);
+        g.set_save(path.clone(), true);
+        g.world.set(10, 10, 10, Block::Torch);
+        assert!(g.save().is_ok());
+        assert!(path.exists());
+
+        let loaded = Game3::load_from(&path).expect("world should load");
+        assert_eq!(loaded.world.get(10, 10, 10), Block::Torch);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::env::remove_var("PARTY_DIR");
     }
 
     #[test]

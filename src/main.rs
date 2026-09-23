@@ -52,7 +52,7 @@ The default mode is first-person 3D. Worlds autosave to
 seeds) and ~/.termcraft/save.json (2D) on quit.
 
 MULTIPLAYER:
-  Run `termcraft --seed 7` in two terminals and you're in the same world:
+  Run `termcraft --seed 42` in two terminals and you're in the same world:
   the first one hosts it, the second joins and gets the host's copy. You
   see each other's avatars, share every block that gets mined or placed,
   chat with `t`, list players with Tab, and can punch each other with `x`.
@@ -439,5 +439,77 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(heard, "the guest never received the host's chat line");
+    }
+
+    #[test]
+    fn test_host_failover_and_reconnection() {
+        let seed = 0xD00D_1234_5678_4321;
+        let mut host = start_multiplayer(seed, &opts("host1"), true).expect("hosts the seed");
+        assert!(host.owns_save(), "original host should own save");
+
+        let joining = std::thread::spawn(move || start_multiplayer(seed, &opts("guest1"), true));
+        let mut guest1 = loop {
+            host.tick();
+            if joining.is_finished() {
+                break joining.join().unwrap().expect("guest1 joins");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(!guest1.owns_save(), "guest1 initially should not own save");
+
+        // Let them sync initial states
+        for _ in 0..20 {
+            host.tick();
+            guest1.tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // Drop the original host
+        drop(host);
+
+        // Guest1 ticks, detects disconnect, and automatically migrates to become Host
+        for _ in 0..20 {
+            guest1.tick();
+            if guest1.owns_save() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(guest1.owns_save(), "guest1 should have promoted to Host");
+        assert!(guest1.is_multiplayer(), "guest1 should remain in multiplayer");
+
+        // Now a new guest2 joins the promoted host (guest1)
+        let joining2 = std::thread::spawn(move || start_multiplayer(seed, &opts("guest2"), true));
+        let mut guest2 = loop {
+            guest1.tick();
+            if joining2.is_finished() {
+                break joining2.join().unwrap().expect("guest2 joins new host");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(!guest2.owns_save());
+        assert!(guest2.is_multiplayer());
+
+        // Verify communication between promoted host (guest1) and new guest (guest2)
+        guest1.chat_open = true;
+        for c in "failover_success".chars() {
+            guest1.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        guest1.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let mut heard = false;
+        for _ in 0..60 {
+            guest1.tick();
+            guest2.tick();
+            if guest2
+                .recent_chat()
+                .iter()
+                .any(|(from, text, _)| from == "guest1" && text == "failover_success")
+            {
+                heard = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(heard, "guest2 never received the promoted host's chat");
     }
 }

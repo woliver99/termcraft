@@ -10,6 +10,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -238,6 +239,7 @@ enum Inner {
         /// client happens to be connected right now.
         #[allow(dead_code)]
         tx: Sender<HostIn>,
+        shutdown: Arc<AtomicBool>,
     },
     Client {
         rx: Receiver<ToClient>,
@@ -302,12 +304,30 @@ impl Net {
         Self::host(seed, name, bind, listener)
     }
 
+    /// Creates a host session from an already bound listener (used for host failover).
+    pub fn host_from_listener(
+        seed: u64,
+        me: String,
+        addr: SocketAddr,
+        listener: TcpListener,
+    ) -> std::io::Result<Net> {
+        Self::host(seed, me, addr, listener)
+    }
+
+    /// Reconnects to an active session as a client (used for host failover).
+    pub fn reconnect_client(seed: u64, me: String, addr: SocketAddr) -> std::io::Result<Net> {
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(800))?;
+        Self::client(seed, me, addr, stream)
+    }
+
     fn host(
         seed: u64,
         me: String,
         addr: SocketAddr,
         listener: TcpListener,
     ) -> std::io::Result<Net> {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shut = Arc::clone(&shutdown);
         let (tx, rx) = channel::<HostIn>();
         let accept_tx = tx.clone();
         thread::Builder::new()
@@ -315,7 +335,13 @@ impl Net {
             .spawn(move || {
                 let mut next_conn = 1u32;
                 for stream in listener.incoming() {
+                    if shut.load(Ordering::SeqCst) {
+                        break;
+                    }
                     let Ok(stream) = stream else { break };
+                    if shut.load(Ordering::SeqCst) {
+                        break;
+                    }
                     let id = next_conn;
                     next_conn += 1;
                     let (out_tx, out_rx) = channel::<ToClient>();
@@ -353,6 +379,7 @@ impl Net {
                 conns: Vec::new(),
                 rx,
                 tx,
+                shutdown,
             },
             pending_snapshots: Vec::new(),
         })
@@ -756,7 +783,9 @@ impl Net {
                     }),
                     Ok(ToClient::Time { t }) => out.push(NetEvent::Time(t)),
                     Ok(ToClient::Reject { why }) => out.push(NetEvent::Disconnected(why)),
-                    Ok(ToClient::Welcome { .. }) => {} // already handled at join
+                    Ok(ToClient::Welcome { time, .. }) => {
+                        out.push(NetEvent::Time(time));
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         lost = true;
@@ -779,6 +808,16 @@ impl Net {
         match &self.inner {
             Inner::Host { conns, .. } => conns.iter().filter(|c| c.joined).count(),
             Inner::Client { .. } => 1,
+        }
+    }
+}
+
+impl Drop for Net {
+    fn drop(&mut self) {
+        if let Inner::Host { shutdown, .. } = &self.inner {
+            shutdown.store(true, Ordering::SeqCst);
+            // Connect to listener to unblock incoming() so listener drops and releases port immediately
+            let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(50));
         }
     }
 }
