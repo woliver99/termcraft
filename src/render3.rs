@@ -346,6 +346,9 @@ pub fn draw(f: &mut Frame, g: &mut Game3) {
     if g.crafting_open {
         draw_crafting(f, g, area);
     }
+    if g.inventory_open {
+        draw_inventory(f, g, area);
+    }
     if g.help_open {
         // Creative rewrites the movement bindings; keep survival text otherwise.
         let movement: &[(&str, &str)] = if g.creative {
@@ -372,7 +375,9 @@ pub fn draw(f: &mut Frame, g: &mut Game3) {
             ),
             ("  z / right-click", "place selected block on targeted face"),
             ("  1-9", "select hotbar slot"),
+            ("  e / i", "open inventory & equip items"),
             ("  c", "crafting menu"),
+            ("  F4 / g", "toggle Creative mode"),
             ("Multiplayer", ""),
             ("  --seed <N>", "same seed = same shared world"),
             ("  t", "chat with everyone in the world"),
@@ -386,9 +391,9 @@ pub fn draw(f: &mut Frame, g: &mut Game3) {
             (
                 "Tip",
                 if g.creative {
-                    "creative: no gravity or fall damage - still collides with blocks"
+                    "creative: fly, no damage, infinite blocks (F4 toggles)"
                 } else {
-                    "craft torches before nightfall - caves are dark!"
+                    "press 'e' to equip collected blocks from your inventory!"
                 },
             ),
         ];
@@ -682,12 +687,17 @@ fn draw_hud(f: &mut Frame, g: &Game3, area: Rect, hud_h: u16) {
             Some(b) => {
                 let n = g.count(*b);
                 let c = b.color3d();
-                let st = if n == 0 {
+                let st = if !g.creative && n == 0 {
                     Style::default().fg(Color::DarkGray)
                 } else {
                     Style::default().fg(Color::Rgb(c.0, c.1, c.2))
                 };
-                Span::styled(format!("{}{:<3}", b.glyph(), n.min(999)), st)
+                let count_str = if g.creative {
+                    "∞  ".to_string()
+                } else {
+                    format!("{:<3}", n.min(999))
+                };
+                Span::styled(format!("{}{}", b.glyph(), count_str), st)
             }
             None => Span::raw("    "),
         };
@@ -723,14 +733,14 @@ fn draw_hud(f: &mut Frame, g: &Game3, area: Rect, hud_h: u16) {
 
     let help = if g.creative {
         if g.is_multiplayer() {
-            "h help  w/a/s/d fly  space up  f down  x mine  z place  c craft  t chat  Tab players  q quit"
+            "h help  e inv  w/a/s/d fly  space up  f down  x mine  z place  c craft  t chat  Tab players  q quit"
         } else {
-            "h help  w/a/s/d fly  ←↑→↓ look  space up  f down  x mine  z place  c craft  q quit"
+            "h help  e inv  w/a/s/d fly  ←↑→↓ look  space up  f down  x mine  z place  c craft  q quit"
         }
     } else if g.is_multiplayer() {
-        "h help  w/a/s/d move  x mine  z place  c craft  t chat  Tab players  q quit"
+        "h help  e inv  w/a/s/d move  x mine  z place  c craft  t chat  Tab players  q quit"
     } else {
-        "h help  w/a/s/d move  ←↑→↓ look  space jump  x mine  z place  c craft  q quit"
+        "h help  e inv  w/a/s/d move  ←↑→↓ look  space jump  x mine  z place  c craft  q quit"
     };
     f.render_widget(
         Paragraph::new(help).style(
@@ -798,6 +808,110 @@ fn draw_crafting(f: &mut Frame, g: &Game3, area: Rect) {
 
     let block = WBlock::default()
         .title(" Crafting - ↑/↓ select, Enter craft, Esc close ")
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Rgb(25, 25, 32)));
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+fn draw_inventory(f: &mut Frame, g: &Game3, area: Rect) {
+    let items = g.available_inventory_blocks();
+    let max_rows = 14;
+    let visible_rows = items.len().clamp(1, max_rows);
+    let modal_h = (visible_rows as u16 + 8).min(area.height.saturating_sub(2));
+    let modal_w = 60.min(area.width.saturating_sub(2));
+    let rect = centered(area, modal_w, modal_h);
+    f.render_widget(Clear, rect);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if items.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "  Inventory is empty! Mine blocks in survival or switch to creative.",
+            Style::default().fg(Color::Rgb(160, 160, 170)),
+        )));
+    } else {
+        // Calculate scroll window
+        let content_h = (modal_h.saturating_sub(7) as usize).max(1);
+        let scroll_top = if g.inv_sel >= content_h {
+            g.inv_sel + 1 - content_h
+        } else {
+            0
+        };
+        let visible_items = &items[scroll_top..items.len().min(scroll_top + content_h)];
+
+        for (rel_idx, &(b, count)) in visible_items.iter().enumerate() {
+            let actual_idx = scroll_top + rel_idx;
+            let sel = actual_idx == g.inv_sel;
+            let c = b.color3d();
+            let name_style = if sel {
+                Style::default()
+                    .fg(Color::Rgb(c.0, c.1, c.2))
+                    .add_modifier(Modifier::BOLD)
+                    .bg(Color::Rgb(50, 50, 60))
+            } else {
+                Style::default().fg(Color::Rgb(c.0, c.1, c.2))
+            };
+            let prefix = if sel { "> " } else { "  " };
+            let count_label = if g.creative {
+                "∞ (Creative)".to_string()
+            } else {
+                format!("x{count}")
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    prefix,
+                    if sel {
+                        Style::default().fg(Color::Yellow).bg(Color::Rgb(50, 50, 60))
+                    } else {
+                        Style::default()
+                    },
+                ),
+                Span::styled(format!("{} {:<16}", b.glyph(), b.name()), name_style),
+                Span::styled(
+                    format!(" {:>14}", count_label),
+                    if sel {
+                        Style::default()
+                            .fg(Color::Rgb(200, 220, 255))
+                            .bg(Color::Rgb(50, 50, 60))
+                    } else {
+                        Style::default().fg(Color::Rgb(160, 170, 180))
+                    },
+                ),
+            ]));
+        }
+    }
+
+    lines.push(Line::raw(""));
+    // Hotbar preview row
+    let mut hotbar_spans = vec![Span::styled(
+        "Hotbar: ",
+        Style::default().fg(Color::Rgb(180, 180, 190)),
+    )];
+    for (i, slot) in g.hotbar.iter().enumerate() {
+        let is_current = i == g.selected;
+        let slot_color = if is_current {
+            Color::Yellow
+        } else {
+            Color::Rgb(120, 120, 130)
+        };
+        let slot_text = match slot {
+            Some(b) => format!("{}:{}", i + 1, b.glyph()),
+            None => format!("{}:-", i + 1),
+        };
+        hotbar_spans.push(Span::styled(
+            format!("[{slot_text}] "),
+            Style::default().fg(slot_color),
+        ));
+    }
+    lines.push(Line::from(hotbar_spans));
+
+    let title = if g.creative {
+        " Inventory (Creative) - ↑/↓ select, 1-9/Enter equip, Esc/e close "
+    } else {
+        " Inventory - ↑/↓ select, 1-9/Enter equip, Esc/e close "
+    };
+    let block = WBlock::default()
+        .title(title)
         .borders(Borders::ALL)
         .style(Style::default().bg(Color::Rgb(25, 25, 32)));
     f.render_widget(Paragraph::new(lines).block(block), rect);
@@ -966,5 +1080,17 @@ mod tests {
             diffs > 200,
             "view barely changed when pitching down ({diffs} px)"
         );
+    }
+
+    #[test]
+    fn inventory_renders_correctly() {
+        let mut g = Game3::new(7);
+        g.inventory_open = true;
+        let buf = render_frame(&mut g);
+        let text: String = (0..24u16)
+            .flat_map(|y| (0..80u16).map(move |x| (x, y)))
+            .map(|p| buf[p].symbol().to_string())
+            .collect();
+        assert!(text.contains("Inventory"));
     }
 }

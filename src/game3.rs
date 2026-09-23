@@ -205,9 +205,12 @@ pub struct Game3 {
     pub should_quit: bool,
     pub crafting_open: bool,
     pub craft_sel: usize,
+    pub inventory_open: bool,
+    pub inv_sel: usize,
     pub help_open: bool,
     pub msg: Option<(String, u64)>,
     pub game_over: bool,
+    pub last_autosave: u64,
     // multiplayer
     /// `None` in single player, or after the link drops.
     pub net: Option<Net>,
@@ -280,9 +283,12 @@ impl Game3 {
             should_quit: false,
             crafting_open: false,
             craft_sel: 0,
+            inventory_open: false,
+            inv_sel: 0,
             help_open: false,
             msg: None,
             game_over: false,
+            last_autosave: 0,
             move_fwd: 0.0,
             move_strafe: 0.0,
             move_timer: 0,
@@ -362,6 +368,24 @@ impl Game3 {
         raycast(&self.world, self.eye(), self.forward(), REACH3)
     }
 
+    /// Items that can be equipped to hotbar: all collected blocks in survival,
+    /// or all existing blocks in creative.
+    pub fn available_inventory_blocks(&self) -> Vec<(Block, u32)> {
+        if self.creative {
+            crate::block::ALL_BLOCKS
+                .iter()
+                .filter(|&&b| b != Block::Air)
+                .map(|&b| (b, u32::MAX))
+                .collect()
+        } else {
+            self.inv
+                .iter()
+                .filter(|(_, &n)| n > 0)
+                .map(|(&b, &n)| (b, n))
+                .collect()
+        }
+    }
+
     // ---------------------------------------------------------- multiplayer
 
     /// Joins this session to a network link. Also adopts the link's player
@@ -438,6 +462,17 @@ impl Game3 {
         self.chat_input.clear();
         self.chat_open = false;
         if text.is_empty() {
+            return;
+        }
+        let lower = text.to_lowercase();
+        if matches!(lower.as_str(), "/creative" | "/gamemode creative" | "/gamemode 1" | "/gamemode c") {
+            self.set_creative(true);
+            self.say("Switched to Creative Mode!");
+            return;
+        }
+        if matches!(lower.as_str(), "/survival" | "/gamemode survival" | "/gamemode 0" | "/gamemode s") {
+            self.set_creative(false);
+            self.say("Switched to Survival Mode!");
             return;
         }
         let me = self.name.clone();
@@ -636,6 +671,13 @@ impl Game3 {
         if !self.hotbar.contains(&Some(b)) {
             if let Some(slot) = self.hotbar.iter_mut().find(|s| s.is_none()) {
                 *slot = Some(b);
+            } else if let Some(idx) = self
+                .hotbar
+                .iter()
+                .position(|s| s.map(|item| self.count(item) == 0).unwrap_or(false))
+            {
+                // If all slots are occupied, replace a slot that has 0 items remaining
+                self.hotbar[idx] = Some(b);
             }
         }
     }
@@ -712,7 +754,7 @@ impl Game3 {
             self.say("Empty hotbar slot - select a block with 1-9.");
             return;
         };
-        if self.count(b) == 0 {
+        if !self.creative && self.count(b) == 0 {
             let m = format!("Out of {}.", b.name());
             self.say(&m);
             return;
@@ -748,7 +790,9 @@ impl Game3 {
                 return;
             }
         }
-        self.remove_item(b, 1);
+        if !self.creative {
+            self.remove_item(b, 1);
+        }
         self.set_block_synced(tx, ty, tz, b);
     }
 
@@ -896,6 +940,48 @@ impl Game3 {
             }
             return;
         }
+        if self.inventory_open {
+            let items = self.available_inventory_blocks();
+            let count = items.len();
+            match k.code {
+                KeyCode::Esc
+                | KeyCode::Char('e')
+                | KeyCode::Char('E')
+                | KeyCode::Char('i')
+                | KeyCode::Char('I')
+                | KeyCode::Char('q') => {
+                    self.inventory_open = false;
+                }
+                KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('W') | KeyCode::Char('k') | KeyCode::Char('K') => {
+                    if count > 0 {
+                        self.inv_sel = self.inv_sel.checked_sub(1).unwrap_or(count - 1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Char('j') | KeyCode::Char('J') => {
+                    if count > 0 {
+                        self.inv_sel = (self.inv_sel + 1) % count;
+                    }
+                }
+                KeyCode::Char(ch @ '1'..='9') => {
+                    let slot = ch as usize - '1' as usize;
+                    if let Some(&(block, _)) = items.get(self.inv_sel) {
+                        self.hotbar[slot] = Some(block);
+                        self.selected = slot;
+                        let m = format!("Equipped {} to slot {}", block.name(), slot + 1);
+                        self.say(&m);
+                    }
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    if let Some(&(block, _)) = items.get(self.inv_sel) {
+                        self.hotbar[self.selected] = Some(block);
+                        let m = format!("Equipped {} to slot {}", block.name(), self.selected + 1);
+                        self.say(&m);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.help_open {
             if matches!(
                 k.code,
@@ -957,6 +1043,19 @@ impl Game3 {
                 self.crafting_open = true;
                 self.craft_sel = 0;
             }
+            KeyCode::Char('e') | KeyCode::Char('E') | KeyCode::Char('i') | KeyCode::Char('I') => {
+                self.inventory_open = true;
+                self.inv_sel = 0;
+            }
+            KeyCode::F(4) | KeyCode::Char('g') | KeyCode::Char('G') => {
+                let new_mode = !self.creative;
+                self.set_creative(new_mode);
+                if new_mode {
+                    self.say("Switched to Creative Mode!");
+                } else {
+                    self.say("Switched to Survival Mode!");
+                }
+            }
             KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') | KeyCode::F(1) => {
                 self.help_open = true;
             }
@@ -978,7 +1077,7 @@ impl Game3 {
     }
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
-        if self.game_over || self.crafting_open || self.help_open || self.chat_open {
+        if self.game_over || self.crafting_open || self.inventory_open || self.help_open || self.chat_open {
             return;
         }
         match m.kind {
@@ -1011,6 +1110,15 @@ impl Game3 {
         }
         self.time += 1;
         self.net_sync();
+
+        // Autosave player and world periodically (every 30 seconds = 600 ticks)
+        if self.time.saturating_sub(self.last_autosave) >= 600 {
+            self.last_autosave = self.time;
+            let _ = self.save_player();
+            if self.owns_save {
+                let _ = self.save();
+            }
+        }
 
         // Movement intent. In hold mode the held key flags drive movement
         // continuously; otherwise fall back to a short timer refreshed by
@@ -1201,7 +1309,7 @@ impl Game3 {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         }
         Ok(())
     }
@@ -1211,8 +1319,21 @@ impl Game3 {
             return false;
         }
         let path = player_save_path(self.seed, &self.name);
-        let Ok(json) = std::fs::read_to_string(&path) else {
-            return false;
+        let json = match std::fs::read_to_string(&path) {
+            Ok(j) => j,
+            Err(_) => {
+                // Fallback to legacy path in PARTY_DIR if present
+                if let Ok(party_dir) = std::env::var("PARTY_DIR") {
+                    let clean_name = crate::net::sanitize_name(&self.name);
+                    let old_path = PathBuf::from(party_dir.trim()).join(format!("player-{}-{clean_name}.json", self.seed));
+                    match std::fs::read_to_string(&old_path) {
+                        Ok(j) => j,
+                        Err(_) => return false,
+                    }
+                } else {
+                    return false;
+                }
+            }
         };
         let Ok(data): Result<PlayerSave, _> = serde_json::from_str(&json) else {
             return false;
@@ -1263,16 +1384,48 @@ impl Game3 {
             selected: self.selected,
         };
         if let Some(dir) = self.save_path.parent() {
-            std::fs::create_dir_all(dir)?;
+            let _ = std::fs::create_dir_all(dir);
         }
         let json = serde_json::to_string(&data)?;
-        std::fs::write(&self.save_path, json)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.save_path, std::fs::Permissions::from_mode(0o666));
+
+        // Try opening existing file without O_CREAT first to avoid Linux fs.protected_regular
+        // restrictions in sticky 1777 directories when another user owns the file.
+        let write_result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&self.save_path)
+            {
+                Ok(f) => f,
+                Err(_) => std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&self.save_path)?,
+            };
+            file.write_all(json.as_bytes())?;
+            file.flush()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&self.save_path, std::fs::Permissions::from_mode(0o666));
+            }
+            Ok(())
+        })();
+
+        // Also always save a backup copy to ~/.termcraft/world-<seed>.json
+        let backup_path = crate::game::home_dir()
+            .join(".termcraft")
+            .join(format!("world-{}.json", self.seed));
+        if backup_path != self.save_path {
+            if let Some(dir) = backup_path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&backup_path, &json);
         }
-        Ok(())
+
+        write_result
     }
 
     pub fn load() -> Option<Game3> {
@@ -1281,7 +1434,30 @@ impl Game3 {
 
     /// Loads a world from a specific save file, e.g. a per-seed shared world.
     pub fn load_from(path: &std::path::Path) -> Option<Game3> {
-        let json = std::fs::read_to_string(path).ok()?;
+        let json = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => {
+                // If path is in data/world-X.json, also check party_dir/world-X.json
+                if let Some(filename) = path.file_name() {
+                    if let Ok(party_dir) = std::env::var("PARTY_DIR") {
+                        let fallback = PathBuf::from(party_dir.trim()).join(filename);
+                        if fallback != path {
+                            if let Ok(s) = std::fs::read_to_string(&fallback) {
+                                s
+                            } else {
+                                return None;
+                            }
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            }
+        };
         let data: Save3 = serde_json::from_str(&json).ok()?;
         let world = World3::from_bytes(&data.tiles, data.spawn)?;
         let mut g = Game3::from_world(data.seed, world);
@@ -1337,9 +1513,9 @@ pub fn seed_save_path(seed: u64) -> PathBuf {
     if let Ok(party_dir) = std::env::var("PARTY_DIR") {
         let p = party_dir.trim();
         if !p.is_empty() {
-            let path = PathBuf::from(p);
-            let _ = std::fs::create_dir_all(&path);
-            return path.join(format!("world-{seed}.json"));
+            let data_dir = PathBuf::from(p).join("data");
+            let _ = std::fs::create_dir_all(&data_dir);
+            return data_dir.join(format!("world-{seed}.json"));
         }
     }
     crate::game::home_dir()
@@ -1360,14 +1536,6 @@ pub struct PlayerSave {
 
 pub fn player_save_path(seed: u64, name: &str) -> PathBuf {
     let clean_name = crate::net::sanitize_name(name);
-    if let Ok(party_dir) = std::env::var("PARTY_DIR") {
-        let p = party_dir.trim();
-        if !p.is_empty() {
-            let path = PathBuf::from(p);
-            let _ = std::fs::create_dir_all(&path);
-            return path.join(format!("player-{seed}-{clean_name}.json"));
-        }
-    }
     crate::game::home_dir()
         .join(".termcraft")
         .join(format!("player-{seed}-{clean_name}.json"))
@@ -1416,7 +1584,7 @@ mod tests {
         std::env::set_var("PARTY_DIR", &temp_dir);
 
         let path = seed_save_path(99);
-        assert_eq!(path, temp_dir.join("world-99.json"));
+        assert_eq!(path, temp_dir.join("data").join("world-99.json"));
 
         let mut g = Game3::new(99);
         g.set_save(path.clone(), true);
@@ -1429,6 +1597,62 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::env::remove_var("PARTY_DIR");
+    }
+
+    #[test]
+    fn creative_mode_allows_infinite_block_placement() {
+        let mut g = Game3::new(9);
+        for _ in 0..100 {
+            g.tick();
+        }
+        g.set_creative(true);
+        g.hotbar[0] = Some(Block::StoneBrick);
+        assert_eq!(g.count(Block::StoneBrick), 0);
+        g.selected = 0;
+        g.pitch = -1.2;
+        let before_target = g.target().expect("looking at ground");
+        g.place();
+        assert_eq!(g.count(Block::StoneBrick), 0);
+        // Placed block exists in world
+        let placed_block = g.world.get(before_target.x + before_target.nx, before_target.y + before_target.ny, before_target.z + before_target.nz);
+        assert_eq!(placed_block, Block::StoneBrick);
+    }
+
+    #[test]
+    fn inventory_modal_equips_to_hotbar() {
+        let mut g = Game3::new(9);
+        g.add_item(Block::Wood, 5);
+        g.add_item(Block::Dirt, 10);
+        // Open inventory
+        g.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(g.inventory_open);
+        // Available blocks should contain Wood and Dirt
+        let items = g.available_inventory_blocks();
+        assert!(!items.is_empty());
+        // Select second item and equip to slot 5 (hotbar index 4)
+        g.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        g.on_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+        assert_eq!(g.hotbar[4], Some(items[1].0));
+        assert_eq!(g.selected, 4);
+        // Close inventory
+        g.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(!g.inventory_open);
+    }
+
+    #[test]
+    fn autosave_periodically_triggers() {
+        let mut g = Game3::new(9);
+        g.name = "autosave_test_player".to_string();
+        g.time = 0;
+        g.last_autosave = 0;
+        // Fast forward 600 ticks
+        for _ in 0..600 {
+            g.tick();
+        }
+        assert_eq!(g.last_autosave, 600);
+        let path = player_save_path(9, "autosave_test_player");
+        assert!(path.exists());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
