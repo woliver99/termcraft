@@ -1096,13 +1096,76 @@ impl Game3 {
     // ------------------------------------------------------------- save/load
 
     pub fn do_save(&mut self) {
+        let _ = self.save_player();
         match self.save() {
             Ok(_) => self.say("World saved."),
             Err(e) => {
-                let m = format!("Save failed: {e}");
-                self.say(&m);
+                if !self.owns_save {
+                    self.say("Player progress saved.");
+                } else {
+                    let m = format!("Save failed: {e}");
+                    self.say(&m);
+                }
             }
         }
+    }
+
+    pub fn save_player(&self) -> std::io::Result<()> {
+        if self.name.is_empty() {
+            return Ok(());
+        }
+        let data = PlayerSave {
+            pos: (self.px, self.py, self.pz),
+            yaw: self.yaw,
+            pitch: self.pitch,
+            hp: self.hp,
+            inv: self.inv.iter().map(|(b, n)| (b.to_u8(), *n)).collect(),
+            hotbar: self
+                .hotbar
+                .iter()
+                .map(|s| s.map(|b| b.to_u8() as i16).unwrap_or(-1))
+                .collect(),
+            selected: self.selected,
+        };
+        let path = player_save_path(self.seed, &self.name);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let json = serde_json::to_string(&data)?;
+        std::fs::write(&path, json)
+    }
+
+    pub fn load_player(&mut self) -> bool {
+        if self.name.is_empty() {
+            return false;
+        }
+        let path = player_save_path(self.seed, &self.name);
+        let Ok(json) = std::fs::read_to_string(&path) else {
+            return false;
+        };
+        let Ok(data): Result<PlayerSave, _> = serde_json::from_str(&json) else {
+            return false;
+        };
+        self.px = data.pos.0;
+        self.py = data.pos.1;
+        self.pz = data.pos.2;
+        self.yaw = data.yaw;
+        self.pitch = data.pitch;
+        self.hp = data.hp;
+        self.inv = data
+            .inv
+            .into_iter()
+            .map(|(b, n)| (Block::from_u8(b), n))
+            .collect();
+        for (i, v) in data.hotbar.iter().take(9).enumerate() {
+            self.hotbar[i] = if *v >= 0 {
+                Some(Block::from_u8(*v as u8))
+            } else {
+                None
+            };
+        }
+        self.selected = data.selected.min(8);
+        true
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -1199,9 +1262,59 @@ pub fn seed_save_path(seed: u64) -> PathBuf {
         .join(format!("world-{seed}.json"))
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PlayerSave {
+    pub pos: (f32, f32, f32),
+    pub yaw: f32,
+    pub pitch: f32,
+    pub hp: i32,
+    pub inv: Vec<(u8, u32)>,
+    pub hotbar: Vec<i16>,
+    pub selected: usize,
+}
+
+pub fn player_save_path(seed: u64, name: &str) -> PathBuf {
+    let clean_name = crate::net::sanitize_name(name);
+    crate::game::home_dir()
+        .join(".termcraft")
+        .join(format!("player-{seed}-{clean_name}.json"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn player_save_and_load_roundtrips() {
+        let mut g = Game3::new(42);
+        g.name = "test_player".to_string();
+        g.px = 12.5;
+        g.py = 34.0;
+        g.pz = 56.5;
+        g.yaw = 1.2;
+        g.pitch = -0.5;
+        g.hp = 15;
+        g.inv.insert(Block::Wood, 7);
+        g.hotbar[0] = Some(Block::Torch);
+        g.selected = 2;
+
+        assert!(g.save_player().is_ok());
+
+        let mut g2 = Game3::new(42);
+        g2.name = "test_player".to_string();
+        assert!(g2.load_player());
+
+        assert!((g2.px - 12.5).abs() < 1e-4);
+        assert!((g2.py - 34.0).abs() < 1e-4);
+        assert!((g2.pz - 56.5).abs() < 1e-4);
+        assert_eq!(g2.hp, 15);
+        assert_eq!(g2.inv.get(&Block::Wood), Some(&7));
+        assert_eq!(g2.hotbar[0], Some(Block::Torch));
+        assert_eq!(g2.selected, 2);
+
+        let path = player_save_path(42, "test_player");
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn player_settles_on_ground() {

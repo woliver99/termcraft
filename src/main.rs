@@ -202,13 +202,14 @@ fn main() -> io::Result<()> {
         game.set_hold_mode(hold_keys);
         let result = run3(&mut terminal, &mut game);
         restore_terminal();
+        let _ = game.save_player();
         if game.owns_save() {
             match game.save() {
                 Ok(()) => println!("World saved to {}", game.save_file().display()),
                 Err(e) => eprintln!("Failed to save world: {e}"),
             }
         } else {
-            println!("The host keeps this world - nothing saved locally.");
+            println!("Player progress saved! (The host keeps the world terrain).");
         }
         println!("Thanks for playing TermCraft!");
         result
@@ -241,6 +242,9 @@ fn start_multiplayer(seed: u64, opts: &NetOpts, force_new: bool) -> Result<Game3
     let owns = net.is_authority();
     game.set_save(path, owns);
     game.attach_net(net);
+    if !force_new && game.load_player() {
+        game.say("Player progress loaded. Welcome back!");
+    }
     Ok(game)
 }
 
