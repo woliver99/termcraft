@@ -44,6 +44,7 @@ OPTIONS:
   --solo         Stay single player even with --seed
   --open         Let other machines on your LAN join this world
   --join <ADDR>  Join a world on another machine (host[:port])
+  --diag, -d     Run input & keyboard protocol diagnostics (troubleshoot Hold Mode)
   --help         Show this help
   --version      Show version
 
@@ -129,6 +130,10 @@ fn main() -> io::Result<()> {
             }
             "--version" | "-V" => {
                 println!("termcraft {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "--diag" | "-d" => {
+                run_diagnostics()?;
                 return Ok(());
             }
             "--2d" => mode_2d = true,
@@ -340,6 +345,189 @@ fn run3(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, game: &mut Game3)
             return Ok(());
         }
     }
+}
+
+fn run_diagnostics() -> io::Result<()> {
+    use std::io::{Read, Write};
+
+    println!("\x1b[1;36m========================================================================\x1b[0m");
+    println!("\x1b[1;36m Terminal Party - Input & Keyboard Protocol Diagnostics 🔍\x1b[0m");
+    println!("\x1b[1;36m========================================================================\x1b[0m");
+
+    // 1. Environment Dump
+    println!("\x1b[1;33m[1/3] Environment Information:\x1b[0m");
+    println!("  • Platform:          {}", std::env::consts::OS);
+    println!("  • TERM:              {}", std::env::var("TERM").unwrap_or_else(|_| "<unset>".into()));
+    println!("  • COLORTERM:         {}", std::env::var("COLORTERM").unwrap_or_else(|_| "<unset>".into()));
+    let wt = std::env::var("WT_SESSION").is_ok();
+    println!("  • Windows Terminal:  {}", if wt { "YES (WT_SESSION detected)" } else { "NO (or over SSH without WT_SESSION passed)" });
+    if let Ok(ssh) = std::env::var("SSH_CONNECTION") {
+        println!("  • SSH Connection:    {}", ssh);
+    }
+    if let Ok(client) = std::env::var("SSH_CLIENT") {
+        println!("  • SSH Client:        {}", client);
+    }
+    if let Ok(tmux) = std::env::var("TMUX") {
+        println!("  • Inside TMUX:       YES ({})", tmux);
+    } else {
+        println!("  • Inside TMUX:       NO");
+    }
+
+    // 2. Protocol Support Check
+    println!("\n\x1b[1;33m[2/3] Protocol Support Check:\x1b[0m");
+    let supports = supports_keyboard_enhancement().unwrap_or(false);
+    if supports {
+        println!("  • Kitty Keyboard Protocol: \x1b[1;32mDetected & Supported!\x1b[0m");
+    } else {
+        println!("  • Kitty Keyboard Protocol: \x1b[1;31mNot detected (no response to CSI ? u)\x1b[0m");
+    }
+
+    // 3. Interactive Raw Input Inspector
+    println!("\n\x1b[1;33m[3/3] Live Input Stream Monitor:\x1b[0m");
+    println!("  Activating Kitty enhancement (\\x1b[>1u)...");
+    println!("  Activating Win32 input mode (\\x1b[?9001h)...");
+    println!("\n  \x1b[1;37mInstructions:\x1b[0m");
+    println!("    1. Press and \x1b[1;32mHOLD 'W'\x1b[0m for 1-2 seconds, then \x1b[1;31mRELEASE\x1b[0m it.");
+    println!("    2. Press and \x1b[1;32mHOLD an Arrow Key\x1b[0m (Left/Right/Up/Down), then \x1b[1;31mRELEASE\x1b[0m it.");
+    println!("    3. Press '\x1b[1;33mq\x1b[0m' or '\x1b[1;33mEsc\x1b[0m' when finished to exit.\n");
+
+    enable_raw_mode()?;
+    {
+        let mut out = io::stdout();
+        let _ = out.write_all(b"\x1b[>1u\x1b[?9001h");
+        let _ = out.flush();
+    }
+
+    print!("\r  {:<12} | {:<28} | {}\r\n", "ELAPSED", "PROTOCOL / EVENT", "RAW BYTES");
+    print!("\r  {:-<12}-+-{:-<28}-+-{:-<30}\r\n", "", "", "");
+    let _ = io::stdout().flush();
+
+    let start_time = Instant::now();
+    let mut saw_kitty_release = false;
+    let mut saw_win32_release = false;
+    let mut _saw_win32_press = false;
+    let mut saw_plain_press = false;
+    let mut repeat_count = 0;
+    let mut last_key_byte = 0u8;
+
+    let mut buf = [0u8; 256];
+    loop {
+        let n = match io::stdin().read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let slice = &buf[..n];
+        let elapsed = format!("+{}ms", start_time.elapsed().as_millis());
+
+        // Check if exit
+        if slice == b"q" || slice == b"Q" || slice == b"\x1b" || slice == b"\x03" {
+            break;
+        }
+
+        // Check for Win32 input mode sequence: \x1b[Vk;Sc;Uc;Kd;Cs;Rc_
+        if slice.starts_with(b"\x1b[") && slice.ends_with(b"_") {
+            if let Ok(s) = std::str::from_utf8(&slice[2..slice.len() - 1]) {
+                let parts: Vec<&str> = s.split(';').collect();
+                if parts.len() >= 4 {
+                    let vk = parts[0];
+                    let kd = parts[3];
+                    let is_press = kd == "1";
+                    if is_press {
+                        _saw_win32_press = true;
+                        print!("\r  {:<12} | \x1b[1;32mWIN32 KEYDOWN (Vk={})\x1b[0m   | {:?}\r\n", elapsed, vk, slice);
+                    } else {
+                        saw_win32_release = true;
+                        print!("\r  {:<12} | \x1b[1;31mWIN32 KEYUP (Vk={})\x1b[0m     | {:?}\r\n", elapsed, vk, slice);
+                    }
+                    let _ = io::stdout().flush();
+                    continue;
+                }
+            }
+        }
+
+        // Check for Kitty keyboard protocol: \x1b[...u or \x1b[...~ with event type
+        if slice.starts_with(b"\x1b[") && (slice.ends_with(b"u") || slice.ends_with(b"~")) {
+            let is_release = slice.windows(2).any(|w| w == b":3" || w == b";3");
+            let is_repeat = slice.windows(2).any(|w| w == b":2" || w == b";2");
+            if is_release {
+                saw_kitty_release = true;
+                print!("\r  {:<12} | \x1b[1;31mKITTY RELEASE\x1b[0m           | {:?}\r\n", elapsed, slice);
+            } else if is_repeat {
+                print!("\r  {:<12} | \x1b[33mKITTY REPEAT\x1b[0m            | {:?}\r\n", elapsed, slice);
+            } else {
+                print!("\r  {:<12} | \x1b[1;32mKITTY PRESS\x1b[0m             | {:?}\r\n", elapsed, slice);
+            }
+            let _ = io::stdout().flush();
+            continue;
+        }
+
+        // ANSI escape sequence (e.g. arrow keys \x1b[A, \x1b[B, \x1b[C, \x1b[D)
+        if slice.starts_with(b"\x1b[") {
+            let name = match slice {
+                b"\x1b[A" => "Arrow Up",
+                b"\x1b[B" => "Arrow Down",
+                b"\x1b[C" => "Arrow Right",
+                b"\x1b[D" => "Arrow Left",
+                _ => "ANSI Escape Sequence",
+            };
+            print!("\r  {:<12} | \x1b[36mANSI: {:<18}\x1b[0m | {:?}\r\n", elapsed, name, slice);
+            let _ = io::stdout().flush();
+            continue;
+        }
+
+        // Plain byte (e.g. 'w', 'a', 's', 'd', Space)
+        if slice.len() == 1 {
+            let b = slice[0];
+            saw_plain_press = true;
+            if b == last_key_byte {
+                repeat_count += 1;
+                print!("\r  {:<12} | \x1b[33mTYPEMATIC REPEAT '{}'\x1b[0m    | [0x{:02x}] (repeat #{})\r\n", elapsed, b as char, b, repeat_count);
+            } else {
+                last_key_byte = b;
+                repeat_count = 0;
+                let ch = if b.is_ascii_graphic() { b as char } else { ' ' };
+                print!("\r  {:<12} | \x1b[1;32mPLAIN BYTE '{}'\x1b[0m         | [0x{:02x}]\r\n", elapsed, ch, b);
+            }
+            let _ = io::stdout().flush();
+            continue;
+        }
+
+        // Any other bytes
+        print!("\r  {:<12} | RAW BYTES                    | {:?}\r\n", elapsed, slice);
+        let _ = io::stdout().flush();
+    }
+
+    // Teardown raw mode & protocols
+    {
+        let mut out = io::stdout();
+        let _ = out.write_all(b"\x1b[<u\x1b[?9001l");
+        let _ = out.flush();
+    }
+    let _ = disable_raw_mode();
+
+    println!("\r\n\x1b[1;36m========================================================================\x1b[0m");
+    println!("\x1b[1;36m Diagnostics Summary & Findings 📋\x1b[0m");
+    println!("\x1b[1;36m========================================================================\x1b[0m");
+
+    if saw_kitty_release {
+        println!("\x1b[1;32m✅ Kitty Keyboard Protocol is fully functional!\x1b[0m");
+        println!("   Key release events are delivered. Hold Mode works natively.");
+    } else if saw_win32_release {
+        println!("\x1b[1;32m✅ Win32 Input Mode is supported by your terminal!\x1b[0m");
+        println!("   Windows Terminal emitted native KeyDown/KeyUp release records (CSI ... _).");
+    } else if saw_plain_press {
+        println!("\x1b[1;31m❌ NO KEY RELEASE EVENTS RECEIVED!\x1b[0m");
+        println!("   Your terminal emulator (or SSH path) only sends raw keypresses & typematic repeats.");
+        println!("   When you hold a key, Windows emits repeated characters ('w', 'w', 'w'...) with NO release on key-up.");
+        println!("   \x1b[1;33mResult:\x1b[0m In this environment, \x1b[1;36mToggle Mode (Compatibility Mode)\x1b[0m is the intended");
+        println!("   and recommended way to play (tap W to walk, S to stop, Arrow keys to turn).");
+        println!("   Alternatively, using an emulator like Alacritty, WezTerm, or Windows Terminal Preview 1.25+");
+        println!("   will provide native Kitty protocol release events.");
+    }
+
+    println!("\x1b[1;36m========================================================================\x1b[0m\n");
+    Ok(())
 }
 
 #[cfg(test)]
