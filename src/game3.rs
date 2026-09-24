@@ -20,6 +20,12 @@ pub enum MigrationResult {
     Reconnected,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InputMode {
+    Hold,
+    Toggle,
+}
+
 pub const REACH3: f32 = 5.0;
 pub const EYE_HEIGHT: f32 = 1.62;
 pub const PLAYER_HALF_W: f32 = 0.3;
@@ -33,6 +39,9 @@ const SWIM_UP: f32 = 0.16;
 const SWIM_MAX_RISE: f32 = 0.35;
 const SAFE_FALL: f32 = -0.62;
 const LOOK_STEP: f32 = 0.10;
+const TURN_SPEED_PER_TICK: f32 = 0.08;
+const PITCH_SPEED_PER_TICK: f32 = 0.06;
+const MOVE_REPEAT_TICKS: u32 = 8;
 /// Damage one punch deals to another player.
 const PUNCH_DMG: i32 = 2;
 /// Peers we haven't heard from in this many ticks are assumed gone.
@@ -226,9 +235,16 @@ pub struct Game3 {
     /// clobber the host's file).
     save_path: PathBuf,
     owns_save: bool,
+    pub input_mode: InputMode,
+    toggle_fwd: f32,
+    toggle_strafe: f32,
+    pub look_yaw: f32,
+    pub look_pitch: f32,
     move_fwd: f32,
     move_strafe: f32,
-    move_timer: u32,
+    move_fwd_timer: u32,
+    move_strafe_timer: u32,
+    move_vert_timer: u32,
     /// True when the terminal reports key release events (kitty protocol),
     /// enabling continuous hold-to-move instead of per-keypress nudges.
     hold_mode: bool,
@@ -239,6 +255,10 @@ pub struct Game3 {
     held_jump: KeyHold,
     /// Descend while flying in creative mode.
     held_down: KeyHold,
+    held_look_left: KeyHold,
+    held_look_right: KeyHold,
+    held_look_up: KeyHold,
+    held_look_down: KeyHold,
     /// Vertical fly intent for non-hold terminals (+1 up / -1 down).
     fly_vertical: f32,
     /// Set once any key release event arrives, proving the terminal
@@ -289,9 +309,16 @@ impl Game3 {
             msg: None,
             game_over: false,
             last_autosave: 0,
+            input_mode: InputMode::Toggle,
+            toggle_fwd: 0.0,
+            toggle_strafe: 0.0,
+            look_yaw: 0.0,
+            look_pitch: 0.0,
             move_fwd: 0.0,
             move_strafe: 0.0,
-            move_timer: 0,
+            move_fwd_timer: 0,
+            move_strafe_timer: 0,
+            move_vert_timer: 0,
             hold_mode: false,
             held_w: KeyHold::default(),
             held_s: KeyHold::default(),
@@ -299,6 +326,10 @@ impl Game3 {
             held_d: KeyHold::default(),
             held_jump: KeyHold::default(),
             held_down: KeyHold::default(),
+            held_look_left: KeyHold::default(),
+            held_look_right: KeyHold::default(),
+            held_look_up: KeyHold::default(),
+            held_look_down: KeyHold::default(),
             fly_vertical: 0.0,
             saw_release: false,
             swim_blocked: false,
@@ -323,6 +354,65 @@ impl Game3 {
 
     pub fn set_hold_mode(&mut self, on: bool) {
         self.hold_mode = on;
+        self.input_mode = if on {
+            InputMode::Hold
+        } else {
+            InputMode::Toggle
+        };
+    }
+
+    pub fn toggle_input_mode(&mut self) {
+        self.input_mode = match self.input_mode {
+            InputMode::Hold => {
+                self.hold_mode = false;
+                self.say("Input Mode: Toggle (W walks, S stops, Arrows turn)");
+                InputMode::Toggle
+            }
+            InputMode::Toggle => {
+                self.toggle_fwd = 0.0;
+                self.toggle_strafe = 0.0;
+                self.look_yaw = 0.0;
+                self.look_pitch = 0.0;
+                self.vx = 0.0;
+                self.vz = 0.0;
+                self.hold_mode = true;
+                self.say("Input Mode: Hold (Hold keys to move/turn)");
+                InputMode::Hold
+            }
+        };
+    }
+
+    pub fn is_walking_forward(&self) -> bool {
+        self.toggle_fwd > 0.0
+    }
+
+    pub fn is_walking_backward(&self) -> bool {
+        self.toggle_fwd < 0.0
+    }
+
+    pub fn is_turning_left(&self) -> bool {
+        self.look_yaw < 0.0
+    }
+
+    pub fn is_turning_right(&self) -> bool {
+        self.look_yaw > 0.0
+    }
+
+    pub fn is_looking_up(&self) -> bool {
+        self.look_pitch > 0.0
+    }
+
+    pub fn is_looking_down(&self) -> bool {
+        self.look_pitch < 0.0
+    }
+
+    pub fn stop_toggle_motion(&mut self) {
+        self.toggle_fwd = 0.0;
+        self.toggle_strafe = 0.0;
+        self.look_yaw = 0.0;
+        self.look_pitch = 0.0;
+        self.vx = 0.0;
+        self.vz = 0.0;
     }
 
     /// Creative mode: always flying, no gravity or fall damage.
@@ -884,6 +974,12 @@ impl Game3 {
         if k.kind == KeyEventKind::Release {
             // Seeing any release proves the terminal reports them reliably.
             self.saw_release = true;
+            self.hold_mode = true;
+            if self.input_mode == InputMode::Toggle {
+                self.input_mode = InputMode::Hold;
+                self.stop_toggle_motion();
+                self.say("Kitty Keyboard Protocol detected: Hold Mode enabled!");
+            }
             match k.code {
                 KeyCode::Char('w') | KeyCode::Char('W') => self.held_w.release(),
                 KeyCode::Char('s') | KeyCode::Char('S') => self.held_s.release(),
@@ -891,6 +987,10 @@ impl Game3 {
                 KeyCode::Char('d') | KeyCode::Char('D') => self.held_d.release(),
                 KeyCode::Char(' ') => self.held_jump.release(),
                 KeyCode::Char('f') | KeyCode::Char('F') => self.held_down.release(),
+                KeyCode::Left => self.held_look_left.release(),
+                KeyCode::Right => self.held_look_right.release(),
+                KeyCode::Up => self.held_look_up.release(),
+                KeyCode::Down => self.held_look_down.release(),
                 _ => {}
             }
             return;
@@ -898,6 +998,7 @@ impl Game3 {
         // Chat swallows every key while it's open, so you can type "quit"
         // without quitting.
         if self.chat_open {
+            self.stop_toggle_motion();
             match k.code {
                 KeyCode::Esc => {
                     self.chat_open = false;
@@ -925,6 +1026,7 @@ impl Game3 {
             return;
         }
         if self.crafting_open {
+            self.stop_toggle_motion();
             match k.code {
                 KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('q') => {
                     self.crafting_open = false
@@ -941,6 +1043,7 @@ impl Game3 {
             return;
         }
         if self.inventory_open {
+            self.stop_toggle_motion();
             let items = self.available_inventory_blocks();
             let count = items.len();
             match k.code {
@@ -983,6 +1086,7 @@ impl Game3 {
             return;
         }
         if self.help_open {
+            self.stop_toggle_motion();
             if matches!(
                 k.code,
                 KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('?') | KeyCode::Char('q')
@@ -998,54 +1102,189 @@ impl Game3 {
         match k.code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('w') | KeyCode::Char('W') => {
-                self.held_w.press(self.time);
-                self.move_fwd = 1.0;
-                self.move_timer = 4;
+                if self.input_mode == InputMode::Toggle {
+                    if k.kind != KeyEventKind::Repeat {
+                        if self.toggle_fwd != 0.0 {
+                            self.toggle_fwd = 0.0;
+                            self.vx = 0.0;
+                            self.vz = 0.0;
+                            self.say("Stopped.");
+                        } else {
+                            self.toggle_fwd = 1.0;
+                            self.say("Walking forward (press S to stop)");
+                        }
+                    }
+                } else {
+                    self.held_w.press(self.time);
+                    self.move_fwd = 1.0;
+                    self.move_fwd_timer = MOVE_REPEAT_TICKS;
+                }
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
-                self.held_s.press(self.time);
-                self.move_fwd = -1.0;
-                self.move_timer = 4;
+                if self.input_mode == InputMode::Toggle {
+                    if k.kind != KeyEventKind::Repeat {
+                        if self.toggle_fwd > 0.0 {
+                            self.toggle_fwd = 0.0;
+                            self.toggle_strafe = 0.0;
+                            self.vx = 0.0;
+                            self.vz = 0.0;
+                            self.say("Stopped.");
+                        } else if self.toggle_fwd < 0.0 {
+                            self.toggle_fwd = 0.0;
+                            self.vx = 0.0;
+                            self.vz = 0.0;
+                            self.say("Stopped.");
+                        } else {
+                            self.toggle_fwd = -1.0;
+                            self.say("Walking backward (press W or S to stop)");
+                        }
+                    }
+                } else {
+                    self.held_s.press(self.time);
+                    self.move_fwd = -1.0;
+                    self.move_fwd_timer = MOVE_REPEAT_TICKS;
+                }
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                self.held_a.press(self.time);
-                self.move_strafe = -1.0;
-                self.move_timer = 4;
+                if self.input_mode == InputMode::Toggle {
+                    if k.kind != KeyEventKind::Repeat {
+                        if self.toggle_strafe < 0.0 {
+                            self.toggle_strafe = 0.0;
+                            self.vx = 0.0;
+                            self.vz = 0.0;
+                        } else if self.toggle_strafe > 0.0 {
+                            self.toggle_strafe = 0.0;
+                            self.vx = 0.0;
+                            self.vz = 0.0;
+                        } else {
+                            self.toggle_strafe = -1.0;
+                        }
+                    }
+                } else {
+                    self.held_a.press(self.time);
+                    self.move_strafe = -1.0;
+                    self.move_strafe_timer = MOVE_REPEAT_TICKS;
+                }
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
-                self.held_d.press(self.time);
-                self.move_strafe = 1.0;
-                self.move_timer = 4;
+                if self.input_mode == InputMode::Toggle {
+                    if k.kind != KeyEventKind::Repeat {
+                        if self.toggle_strafe > 0.0 {
+                            self.toggle_strafe = 0.0;
+                            self.vx = 0.0;
+                            self.vz = 0.0;
+                        } else if self.toggle_strafe < 0.0 {
+                            self.toggle_strafe = 0.0;
+                            self.vx = 0.0;
+                            self.vz = 0.0;
+                        } else {
+                            self.toggle_strafe = 1.0;
+                        }
+                    }
+                } else {
+                    self.held_d.press(self.time);
+                    self.move_strafe = 1.0;
+                    self.move_strafe_timer = MOVE_REPEAT_TICKS;
+                }
             }
             KeyCode::Char(' ') => {
-                self.held_jump.press(self.time);
+                if self.input_mode == InputMode::Hold {
+                    self.held_jump.press(self.time);
+                }
                 if self.creative {
                     self.fly_vertical = 1.0;
-                    self.move_timer = 4;
+                    self.move_vert_timer = MOVE_REPEAT_TICKS;
                 } else {
                     self.jump_or_swim();
                 }
             }
             KeyCode::Char('f') | KeyCode::Char('F') => {
-                self.held_down.press(self.time);
+                if self.input_mode == InputMode::Hold {
+                    self.held_down.press(self.time);
+                }
                 if self.creative {
                     self.fly_vertical = -1.0;
-                    self.move_timer = 4;
+                    self.move_vert_timer = MOVE_REPEAT_TICKS;
                 }
             }
-            KeyCode::Left => self.yaw -= LOOK_STEP,
-            KeyCode::Right => self.yaw += LOOK_STEP,
-            KeyCode::Up => self.pitch = (self.pitch + LOOK_STEP).min(1.45),
-            KeyCode::Down => self.pitch = (self.pitch - LOOK_STEP).max(-1.45),
-            KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Enter => self.mine(),
-            KeyCode::Char('z') | KeyCode::Char('Z') | KeyCode::Char('p') => self.place(),
+            KeyCode::Left => {
+                if self.input_mode == InputMode::Hold {
+                    self.held_look_left.press(self.time);
+                    if k.kind != KeyEventKind::Repeat {
+                        self.yaw -= LOOK_STEP;
+                    }
+                } else if k.kind != KeyEventKind::Repeat {
+                    if self.look_yaw != 0.0 {
+                        self.look_yaw = 0.0;
+                        self.say("Turn stopped.");
+                    } else {
+                        self.look_yaw = -1.0;
+                        self.say("Turning left (press Right or Left to stop)");
+                    }
+                }
+            }
+            KeyCode::Right => {
+                if self.input_mode == InputMode::Hold {
+                    self.held_look_right.press(self.time);
+                    if k.kind != KeyEventKind::Repeat {
+                        self.yaw += LOOK_STEP;
+                    }
+                } else if k.kind != KeyEventKind::Repeat {
+                    if self.look_yaw != 0.0 {
+                        self.look_yaw = 0.0;
+                        self.say("Turn stopped.");
+                    } else {
+                        self.look_yaw = 1.0;
+                        self.say("Turning right (press Left or Right to stop)");
+                    }
+                }
+            }
+            KeyCode::Up => {
+                if self.input_mode == InputMode::Hold {
+                    self.held_look_up.press(self.time);
+                    if k.kind != KeyEventKind::Repeat {
+                        self.pitch = (self.pitch + LOOK_STEP).min(1.45);
+                    }
+                } else if k.kind != KeyEventKind::Repeat {
+                    if self.look_pitch != 0.0 {
+                        self.look_pitch = 0.0;
+                    } else {
+                        self.look_pitch = 1.0;
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if self.input_mode == InputMode::Hold {
+                    self.held_look_down.press(self.time);
+                    if k.kind != KeyEventKind::Repeat {
+                        self.pitch = (self.pitch - LOOK_STEP).max(-1.45);
+                    }
+                } else if k.kind != KeyEventKind::Repeat {
+                    if self.look_pitch != 0.0 {
+                        self.look_pitch = 0.0;
+                    } else {
+                        self.look_pitch = -1.0;
+                    }
+                }
+            }
+            KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Enter => {
+                self.mine();
+            }
+            KeyCode::Char('z') | KeyCode::Char('Z') | KeyCode::Char('p') => {
+                self.place();
+            }
             KeyCode::Char('c') | KeyCode::Char('C') => {
+                self.stop_toggle_motion();
                 self.crafting_open = true;
                 self.craft_sel = 0;
             }
             KeyCode::Char('e') | KeyCode::Char('E') | KeyCode::Char('i') | KeyCode::Char('I') => {
+                self.stop_toggle_motion();
                 self.inventory_open = true;
                 self.inv_sel = 0;
+            }
+            KeyCode::F(2) | KeyCode::Char('m') | KeyCode::Char('M') => {
+                self.toggle_input_mode();
             }
             KeyCode::F(4) | KeyCode::Char('g') | KeyCode::Char('G') => {
                 let new_mode = !self.creative;
@@ -1057,6 +1296,7 @@ impl Game3 {
                 }
             }
             KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') | KeyCode::F(1) => {
+                self.stop_toggle_motion();
                 self.help_open = true;
             }
             KeyCode::Char(ch @ '1'..='9') => {
@@ -1064,6 +1304,7 @@ impl Game3 {
             }
             KeyCode::Char('t') | KeyCode::Char('T') => {
                 if self.is_multiplayer() {
+                    self.stop_toggle_motion();
                     self.chat_open = true;
                     self.chat_input.clear();
                 } else {
@@ -1092,6 +1333,12 @@ impl Game3 {
                     let dy = m.row as f32 - ly as f32;
                     self.yaw += dx * 0.02;
                     self.pitch = (self.pitch - dy * 0.04).clamp(-1.45, 1.45);
+                    if self.move_fwd_timer > 0 {
+                        self.move_fwd_timer = MOVE_REPEAT_TICKS;
+                    }
+                    if self.move_strafe_timer > 0 {
+                        self.move_strafe_timer = MOVE_REPEAT_TICKS;
+                    }
                 }
                 self.last_mouse = Some((m.column, m.row));
             }
@@ -1120,10 +1367,35 @@ impl Game3 {
             }
         }
 
+        // Continuous camera turning from arrow keys
+        if self.input_mode == InputMode::Hold {
+            let trust = self.saw_release;
+            let turn_yaw = (self.held_look_right.active(self.time, trust) as i32
+                - self.held_look_left.active(self.time, trust) as i32) as f32;
+            let turn_pitch = (self.held_look_up.active(self.time, trust) as i32
+                - self.held_look_down.active(self.time, trust) as i32) as f32;
+            if turn_yaw != 0.0 {
+                self.yaw += turn_yaw * TURN_SPEED_PER_TICK;
+            }
+            if turn_pitch != 0.0 {
+                self.pitch = (self.pitch + turn_pitch * PITCH_SPEED_PER_TICK).clamp(-1.45, 1.45);
+            }
+        } else {
+            if self.look_yaw != 0.0 {
+                self.yaw += self.look_yaw * TURN_SPEED_PER_TICK;
+            }
+            if self.look_pitch != 0.0 {
+                let next_pitch = (self.pitch + self.look_pitch * PITCH_SPEED_PER_TICK).clamp(-1.45, 1.45);
+                if (next_pitch - self.pitch).abs() < 0.0001 {
+                    self.look_pitch = 0.0;
+                }
+                self.pitch = next_pitch;
+            }
+        }
+
         // Movement intent. In hold mode the held key flags drive movement
-        // continuously; otherwise fall back to a short timer refreshed by
-        // key auto-repeat.
-        let (mf, ms, mu) = if self.hold_mode {
+        // continuously; in toggle mode toggle_fwd and toggle_strafe drive movement.
+        let (mf, ms, mu) = if self.input_mode == InputMode::Hold {
             let trust = self.saw_release;
             (
                 (self.held_w.active(self.time, trust) as i32
@@ -1137,22 +1409,19 @@ impl Game3 {
                     0.0
                 },
             )
-        } else if self.move_timer > 0 {
-            self.move_timer -= 1;
-            (
-                self.move_fwd,
-                self.move_strafe,
-                if self.creative {
+        } else {
+            let vert = if self.creative {
+                if self.move_vert_timer > 0 {
+                    self.move_vert_timer -= 1;
                     self.fly_vertical
                 } else {
+                    self.fly_vertical = 0.0;
                     0.0
-                },
-            )
-        } else {
-            self.move_fwd = 0.0;
-            self.move_strafe = 0.0;
-            self.fly_vertical = 0.0;
-            (0.0, 0.0, 0.0)
+                }
+            } else {
+                0.0
+            };
+            (self.toggle_fwd, self.toggle_strafe, vert)
         };
 
         if self.creative {
@@ -1202,6 +1471,9 @@ impl Game3 {
                 };
                 self.vx = fx / len * speed;
                 self.vz = fz / len * speed;
+            } else if self.input_mode == InputMode::Toggle {
+                self.vx = 0.0;
+                self.vz = 0.0;
             }
             // Horizontal movement first, so we know whether we're pushing
             // against a bank while swimming.
@@ -1216,7 +1488,7 @@ impl Game3 {
             self.swim_blocked = (blocked_x || blocked_z) && self.in_water();
 
             // Holding space keeps jumping / swimming up.
-            if self.hold_mode && self.held_jump.active(self.time, self.saw_release) {
+            if self.input_mode == InputMode::Hold && self.held_jump.active(self.time, self.saw_release) {
                 self.jump_or_swim();
             }
 
@@ -2003,5 +2275,318 @@ mod tests {
         let n = g.count(item);
         g.place();
         assert_eq!(g.count(item), n - 1);
+    }
+
+    #[test]
+    fn test_holding_arrow_keys_continuously_turns_camera() {
+        use crossterm::event::KeyEventState;
+        let mut g = Game3::new(9);
+        g.set_hold_mode(true);
+        enable_trusted_releases(&mut g);
+        g.yaw = 0.0;
+        g.pitch = 0.0;
+
+        // Press Left arrow key
+        g.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        let yaw_after_press = g.yaw;
+        assert!(yaw_after_press < 0.0, "initial press should nudge yaw");
+
+        // Tick several times while held
+        for _ in 0..10 {
+            g.tick();
+        }
+        let yaw_after_ticks = g.yaw;
+        assert!(
+            yaw_after_ticks < yaw_after_press - 0.5,
+            "holding left should continuously turn yaw, was {yaw_after_ticks}"
+        );
+
+        // Release Left arrow key
+        g.on_key(KeyEvent {
+            code: KeyCode::Left,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: KeyEventState::NONE,
+        });
+
+        let yaw_at_release = g.yaw;
+        for _ in 0..10 {
+            g.tick();
+        }
+        assert_eq!(
+            g.yaw, yaw_at_release,
+            "releasing left must stop turning immediately"
+        );
+    }
+
+    #[test]
+    fn test_wasd_and_arrow_keys_work_concurrently() {
+        let mut g = Game3::new(9);
+        g.set_hold_mode(true);
+        enable_trusted_releases(&mut g);
+        for _ in 0..100 {
+            g.tick(); // settle on ground
+        }
+        g.yaw = 0.0;
+        let start_pos = (g.px, g.pz);
+
+        // Press 'w' and 'Left' arrow key
+        g.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        g.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+
+        for _ in 0..10 {
+            g.tick();
+        }
+
+        let moved = (g.px - start_pos.0).hypot(g.pz - start_pos.1);
+        assert!(moved > 0.5, "player should move forward, moved {moved}");
+        assert!(g.yaw < -0.5, "camera should turn left, yaw is {}", g.yaw);
+    }
+
+    #[test]
+    fn test_auto_detect_defaults_to_toggle_mode_when_unenhanced() {
+        let mut g = Game3::new(9);
+        g.set_hold_mode(false);
+        assert_eq!(g.input_mode, InputMode::Toggle);
+        g.set_hold_mode(true);
+        assert_eq!(g.input_mode, InputMode::Hold);
+    }
+
+    #[test]
+    fn test_release_event_promotes_to_hold_mode() {
+        let mut g = Game3::new(9);
+        g.set_hold_mode(false);
+        assert_eq!(g.input_mode, InputMode::Toggle);
+
+        // A key release event arrives from terminal
+        g.on_key(KeyEvent {
+            code: KeyCode::Char('w'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: crossterm::event::KeyEventState::NONE,
+        });
+
+        assert_eq!(g.input_mode, InputMode::Hold);
+        assert!(g.saw_release);
+    }
+
+    #[test]
+    fn test_toggle_mode_w_starts_and_s_stops() {
+        let mut g = Game3::new(9);
+        g.set_hold_mode(false);
+        for _ in 0..100 {
+            g.tick(); // settle on ground
+        }
+        let start_pos = (g.px, g.pz);
+
+        // Press 'w' once: begins walking forward
+        g.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert!(g.is_walking_forward());
+        assert_eq!(g.toggle_fwd, 1.0);
+
+        // Tick 20 frames without any further key presses: player keeps walking forward
+        for _ in 0..20 {
+            g.tick();
+        }
+        let moved = (g.px - start_pos.0).hypot(g.pz - start_pos.1);
+        assert!(moved > 1.5, "hands-free walking should advance player, moved {moved}");
+
+        // Press 's': immediately stops forward movement
+        g.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(!g.is_walking_forward());
+        assert_eq!(g.toggle_fwd, 0.0);
+
+        let stop_pos = (g.px, g.pz);
+        for _ in 0..10 {
+            g.tick();
+        }
+        let drift = (g.px - stop_pos.0).hypot(g.pz - stop_pos.1);
+        assert!(drift < 0.05, "player should be completely stopped, drifted {drift}");
+    }
+
+    #[test]
+    fn test_toggle_mode_jumping_preserves_forward_momentum() {
+        let mut g = Game3::new(9);
+        g.set_hold_mode(false);
+        for _ in 0..100 {
+            g.tick(); // settle
+        }
+        let start_pos = (g.px, g.pz);
+
+        // Start walking forward
+        g.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert!(g.is_walking_forward());
+
+        // Tick 2 frames forward
+        g.tick();
+        g.tick();
+
+        // Now press Space to jump while walking
+        g.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(g.is_walking_forward());
+        assert!(g.vy > 0.0, "jump should impart upward velocity");
+
+        // Tick through the jump
+        for _ in 0..8 {
+            g.tick();
+        }
+
+        let moved = (g.px - start_pos.0).hypot(g.pz - start_pos.1);
+        assert!(
+            moved > 1.0,
+            "forward momentum must be preserved during jump, moved {moved}"
+        );
+    }
+
+    #[test]
+    fn test_toggle_mode_diagonal_movement() {
+        let mut g = Game3::new(9);
+        g.set_hold_mode(false);
+        for _ in 0..100 {
+            g.tick(); // settle
+        }
+        g.yaw = 0.0;
+        let start_x = g.px;
+        let start_z = g.pz;
+
+        // Toggle 'w' then 'd'
+        g.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        g.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        assert_eq!(g.toggle_fwd, 1.0);
+        assert_eq!(g.toggle_strafe, 1.0);
+
+        for _ in 0..5 {
+            g.tick();
+        }
+
+        // At yaw = 0, +forward is +x, +strafe (d) is +z
+        assert!(g.px > start_x + 0.3, "forward motion active");
+        assert!(g.pz > start_z + 0.3, "strafe motion active");
+    }
+
+    #[test]
+    fn test_toggle_mode_arrow_keys_steer_while_walking() {
+        let mut g = Game3::new(9);
+        g.set_hold_mode(false);
+        for _ in 0..100 {
+            g.tick(); // settle
+        }
+        let start_yaw = g.yaw;
+        let start_pos = (g.px, g.pz);
+
+        // Start walking forward
+        g.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        // Steer left with arrow key
+        g.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+
+        for _ in 0..10 {
+            g.tick();
+        }
+
+        assert!(g.yaw < start_yaw, "camera should turn smoothly while steering");
+        let moved = (g.px - start_pos.0).hypot(g.pz - start_pos.1);
+        assert!(moved > 0.5, "walking forward while turning must work concurrently");
+    }
+
+    #[test]
+    fn test_toggle_mode_arrow_keys_toggle_and_cancel() {
+        let mut g = Game3::new(9);
+        g.set_hold_mode(false);
+        assert_eq!(g.look_yaw, 0.0);
+        assert_eq!(g.look_pitch, 0.0);
+
+        // Press Left: begins hands-free turn left
+        g.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(g.look_yaw, -1.0);
+        assert!(g.is_turning_left());
+
+        // Press Right (opposite key): immediately cancels turn
+        g.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(g.look_yaw, 0.0);
+        assert!(!g.is_turning_left());
+        assert!(!g.is_turning_right());
+
+        // Press Right: begins hands-free turn right
+        g.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(g.look_yaw, 1.0);
+        assert!(g.is_turning_right());
+
+        // Press Right again immediately with zero debounce delay: cancels turn right
+        g.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(g.look_yaw, 0.0);
+        assert!(!g.is_turning_right());
+
+        // Press Up: begins looking up
+        g.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(g.look_pitch, 1.0);
+        assert!(g.is_looking_up());
+
+        // Press Down: cancels look up
+        g.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(g.look_pitch, 0.0);
+        assert!(!g.is_looking_up());
+        assert!(!g.is_looking_down());
+
+        // Quick toggle test: tap Up then immediately tap Up again with 0 tick delay
+        g.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(g.look_pitch, 1.0);
+        g.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(g.look_pitch, 0.0);
+    }
+
+    #[test]
+    fn test_toggle_mode_pitch_clamp_auto_stops() {
+        let mut g = Game3::new(9);
+        g.set_hold_mode(false);
+        g.pitch = 1.40;
+
+        // Press Up: look pitch toggled to 1.0
+        g.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(g.look_pitch, 1.0);
+
+        // Tick several times to reach 1.45 clamp limit
+        for _ in 0..10 {
+            g.tick();
+        }
+
+        // Pitch should be clamped to 1.45 and toggle look_pitch should auto-stop to 0.0
+        assert_eq!(g.pitch, 1.45);
+        assert_eq!(g.look_pitch, 0.0);
+        assert!(!g.is_looking_up());
+    }
+
+    #[test]
+    fn test_f2_and_m_switch_input_modes() {
+        let mut g = Game3::new(9);
+        g.set_hold_mode(false);
+        assert_eq!(g.input_mode, InputMode::Toggle);
+
+        // F2 switches to Hold mode
+        g.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        assert_eq!(g.input_mode, InputMode::Hold);
+
+        // 'm' switches back to Toggle mode
+        g.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(g.input_mode, InputMode::Toggle);
+    }
+
+    #[test]
+    fn test_menu_opening_clears_toggle_movement() {
+        let mut g = Game3::new(9);
+        g.set_hold_mode(false);
+        g.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        g.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        g.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(g.toggle_fwd, 1.0);
+        assert_eq!(g.look_yaw, -1.0);
+        assert_eq!(g.look_pitch, 1.0);
+
+        // Opening inventory stops toggle movement and look
+        g.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert_eq!(g.toggle_fwd, 0.0);
+        assert_eq!(g.look_yaw, 0.0);
+        assert_eq!(g.look_pitch, 0.0);
+        assert!(g.inventory_open);
     }
 }

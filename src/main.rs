@@ -104,6 +104,11 @@ fn restore_terminal() {
         LeaveAlternateScreen,
         DisableMouseCapture
     );
+    if std::env::var_os("TMUX").is_some() {
+        use std::io::Write;
+        let _ = io::stdout().write_all(b"\x1bPtmux;\x1b\x1b[<u\x1b\\");
+        let _ = io::stdout().flush();
+    }
     let _ = disable_raw_mode();
 }
 
@@ -253,13 +258,16 @@ fn start_multiplayer(seed: u64, opts: &NetOpts, force_new: bool) -> Result<Game3
 fn setup_terminal() -> io::Result<(Terminal<CrosstermBackend<io::Stdout>>, bool)> {
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-    let enhanced = supports_keyboard_enhancement().unwrap_or(false);
-    if enhanced {
-        execute!(
-            io::stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
-        )?;
+    if std::env::var_os("TMUX").is_some() {
+        use std::io::Write;
+        let _ = io::stdout().write_all(b"\x1bPtmux;\x1b\x1b[>1u\x1b\\");
+        let _ = io::stdout().flush();
     }
+    let _ = execute!(
+        io::stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+    );
+    let enhanced = supports_keyboard_enhancement().unwrap_or(false);
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;

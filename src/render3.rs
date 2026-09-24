@@ -6,7 +6,7 @@ use ratatui::Frame;
 
 use crate::block::{Block, Rgb};
 use crate::game::{PLAYER_MAX_HP, RECIPES};
-use crate::game3::{peer_box, ray_aabb, raycast, Game3, PLAYER_H};
+use crate::game3::{peer_box, ray_aabb, raycast, Game3, InputMode, PLAYER_H};
 
 const MAX_DIST: f32 = 60.0;
 const HFOV: f32 = 1.5; // ~86 degrees horizontal
@@ -350,21 +350,24 @@ pub fn draw(f: &mut Frame, g: &mut Game3) {
         draw_inventory(f, g, area);
     }
     if g.help_open {
-        // Creative rewrites the movement bindings; keep survival text otherwise.
-        let movement: &[(&str, &str)] = if g.creative {
-            &[
+        let movement: Vec<(&str, &str)> = if g.creative {
+            vec![
                 ("Movement", ""),
-                ("  w / a / s / d", "fly where you look (includes pitch)"),
-                ("  arrow keys", "look around (or drag the mouse)"),
-                ("  space", "rise (hold to keep rising)"),
-                ("  f", "descend (hold to keep descending)"),
+                ("  w / s", "fly forward / backward"),
+                ("  a / d", "strafe left / right"),
+                ("  arrow keys", if g.input_mode == InputMode::Toggle { "toggle turn (opposite arrow stops)" } else { "look around (or drag the mouse)" }),
+                ("  space / f", "fly up / fly down"),
+                ("  F2 / m", "switch Hold vs Toggle mode"),
             ]
         } else {
-            &[
+            vec![
                 ("Movement", ""),
-                ("  w / a / s / d", "move (relative to where you look)"),
-                ("  arrow keys", "look around (or drag the mouse)"),
-                ("  space", "jump / swim up (hold to keep jumping)"),
+                ("  w", if g.input_mode == InputMode::Toggle { "toggle walk forward (S stops)" } else { "walk forward (hold)" }),
+                ("  s", if g.input_mode == InputMode::Toggle { "stop walking / walk backward" } else { "walk backward (hold)" }),
+                ("  a / d", "strafe left / right"),
+                ("  arrow keys", if g.input_mode == InputMode::Toggle { "toggle turn left / right / up / down" } else { "look around (or drag the mouse)" }),
+                ("  space", "jump / swim up"),
+                ("  F2 / m", "switch Hold vs Toggle mode"),
             ]
         };
         let rest: &[(&str, &str)] = &[
@@ -398,7 +401,7 @@ pub fn draw(f: &mut Frame, g: &mut Game3) {
             ),
         ];
         let mut entries = Vec::with_capacity(movement.len() + rest.len());
-        entries.extend_from_slice(movement);
+        entries.extend_from_slice(&movement);
         entries.extend_from_slice(rest);
         draw_help(f, area, &entries);
     }
@@ -649,6 +652,68 @@ fn draw_hud(f: &mut Frame, g: &Game3, area: Rect, hud_h: u16) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    match g.input_mode {
+        InputMode::Toggle => {
+            spans.push(Span::raw("  "));
+            if g.is_walking_forward() {
+                spans.push(Span::styled(
+                    "[WALK ▲ (S stops)]",
+                    Style::default()
+                        .fg(Color::Rgb(255, 230, 80))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else if g.is_walking_backward() {
+                spans.push(Span::styled(
+                    "[WALK ▼ (W stops)]",
+                    Style::default()
+                        .fg(Color::Rgb(255, 230, 80))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    "[Toggle Mode]",
+                    Style::default().fg(Color::Rgb(140, 200, 255)),
+                ));
+            }
+            if g.is_turning_left() {
+                spans.push(Span::styled(
+                    " [TURN ◄]",
+                    Style::default()
+                        .fg(Color::Rgb(255, 200, 100))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else if g.is_turning_right() {
+                spans.push(Span::styled(
+                    " [TURN ►]",
+                    Style::default()
+                        .fg(Color::Rgb(255, 200, 100))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if g.is_looking_up() {
+                spans.push(Span::styled(
+                    " [LOOK ▲]",
+                    Style::default()
+                        .fg(Color::Rgb(200, 220, 255))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else if g.is_looking_down() {
+                spans.push(Span::styled(
+                    " [LOOK ▼]",
+                    Style::default()
+                        .fg(Color::Rgb(200, 220, 255))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+        InputMode::Hold => {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                "[Hold Mode]",
+                Style::default().fg(Color::Rgb(140, 220, 160)),
+            ));
+        }
+    }
     if let Some(badge) = g.net_badge() {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
@@ -733,14 +798,14 @@ fn draw_hud(f: &mut Frame, g: &Game3, area: Rect, hud_h: u16) {
 
     let help = if g.creative {
         if g.is_multiplayer() {
-            "h help  e inv  w/a/s/d fly  space up  f down  x mine  z place  c craft  t chat  Tab players  q quit"
+            "h help  F2 mode  e inv  w/a/s/d fly  space up  f down  x mine  z place  c craft  t chat  Tab players  q quit"
         } else {
-            "h help  e inv  w/a/s/d fly  ←↑→↓ look  space up  f down  x mine  z place  c craft  q quit"
+            "h help  F2 mode  e inv  w/a/s/d fly  ←↑→↓ look  space up  f down  x mine  z place  c craft  q quit"
         }
     } else if g.is_multiplayer() {
-        "h help  e inv  w/a/s/d move  x mine  z place  c craft  t chat  Tab players  q quit"
+        "h help  F2 mode  e inv  w/a/s/d move  x mine  z place  c craft  t chat  Tab players  q quit"
     } else {
-        "h help  e inv  w/a/s/d move  ←↑→↓ look  space jump  x mine  z place  c craft  q quit"
+        "h help  F2 mode  e inv  w/a/s/d move  ←↑→↓ look  space jump  x mine  z place  c craft  q quit"
     };
     f.render_widget(
         Paragraph::new(help).style(

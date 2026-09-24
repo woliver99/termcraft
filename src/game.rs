@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::block::Block;
 use crate::entity::{Entity, SAFE_FALL_VEL};
+pub use crate::game3::InputMode;
 use crate::world::{World, SEA_LEVEL, WORLD_H, WORLD_W};
 
 pub const DAY_LEN: u64 = 2400; // ticks per day (2 minutes at 20 TPS)
@@ -56,6 +57,7 @@ pub const RECIPES: &[Recipe] = &[
 /// How long (in ticks) a key press counts as "held" when we can't trust
 /// release events (key auto-repeat refreshes it while genuinely held).
 pub const HOLD_GRACE_TICKS: u64 = 10;
+pub const MOVE_REPEAT_TICKS: u32 = 8;
 
 /// Tracks a possibly-held key. Some terminals claim kitty keyboard support
 /// but never deliver release events, which would leave a naive flag stuck
@@ -100,6 +102,8 @@ pub struct Game {
     pub game_over: bool,
     pub map_area: Rect,
     pub camera: (i32, i32),
+    pub input_mode: InputMode,
+    pub toggle_dir: i32,
     move_dir: i32,
     move_timer: u32,
     /// True when the terminal reports key release events (kitty protocol),
@@ -139,6 +143,8 @@ impl Game {
             game_over: false,
             map_area: Rect::new(0, 0, 1, 1),
             camera: (0, 0),
+            input_mode: InputMode::Toggle,
+            toggle_dir: 0,
             move_dir: 0,
             move_timer: 0,
             hold_mode: false,
@@ -160,6 +166,27 @@ impl Game {
 
     pub fn set_hold_mode(&mut self, on: bool) {
         self.hold_mode = on;
+        self.input_mode = if on {
+            InputMode::Hold
+        } else {
+            InputMode::Toggle
+        };
+    }
+
+    pub fn toggle_input_mode(&mut self) {
+        self.input_mode = match self.input_mode {
+            InputMode::Hold => {
+                self.hold_mode = false;
+                self.say("Input Mode: Toggle (A/D walks, opposite stops)");
+                InputMode::Toggle
+            }
+            InputMode::Toggle => {
+                self.toggle_dir = 0;
+                self.hold_mode = true;
+                self.say("Input Mode: Hold (Hold keys to move)");
+                InputMode::Hold
+            }
+        };
     }
 
     /// 1.0 = full daylight, 0.15 = night.
@@ -335,6 +362,12 @@ impl Game {
         if k.kind == KeyEventKind::Release {
             // Seeing any release proves the terminal reports them reliably.
             self.saw_release = true;
+            self.hold_mode = true;
+            if self.input_mode == InputMode::Toggle {
+                self.input_mode = InputMode::Hold;
+                self.toggle_dir = 0;
+                self.say("Kitty Keyboard Protocol detected: Hold Mode enabled!");
+            }
             match k.code {
                 KeyCode::Char('a') | KeyCode::Char('A') => self.held_left.release(),
                 KeyCode::Char('d') | KeyCode::Char('D') => self.held_right.release(),
@@ -354,6 +387,7 @@ impl Game {
             return;
         }
         if self.crafting_open {
+            self.toggle_dir = 0;
             match k.code {
                 KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('q') => {
                     self.crafting_open = false
@@ -370,6 +404,7 @@ impl Game {
             return;
         }
         if self.help_open {
+            self.toggle_dir = 0;
             if matches!(
                 k.code,
                 KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('?') | KeyCode::Char('q')
@@ -385,18 +420,46 @@ impl Game {
         match k.code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                self.held_left.press(self.time);
-                self.move_dir = -1;
-                self.move_timer = 4;
+                if self.input_mode == InputMode::Toggle {
+                    if self.toggle_dir < 0 {
+                        self.toggle_dir = 0;
+                        self.say("Stopped.");
+                    } else if self.toggle_dir > 0 {
+                        self.toggle_dir = 0;
+                        self.say("Stopped.");
+                    } else {
+                        self.toggle_dir = -1;
+                        self.say("Walking left (press D or A to stop)");
+                    }
+                } else {
+                    self.held_left.press(self.time);
+                    self.move_dir = -1;
+                    self.move_timer = MOVE_REPEAT_TICKS;
+                }
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
-                self.held_right.press(self.time);
-                self.move_dir = 1;
-                self.move_timer = 4;
+                if self.input_mode == InputMode::Toggle {
+                    if self.toggle_dir > 0 {
+                        self.toggle_dir = 0;
+                        self.say("Stopped.");
+                    } else if self.toggle_dir < 0 {
+                        self.toggle_dir = 0;
+                        self.say("Stopped.");
+                    } else {
+                        self.toggle_dir = 1;
+                        self.say("Walking right (press A or D to stop)");
+                    }
+                } else {
+                    self.held_right.press(self.time);
+                    self.move_dir = 1;
+                    self.move_timer = MOVE_REPEAT_TICKS;
+                }
             }
             KeyCode::Char('w') | KeyCode::Char('W') | KeyCode::Char(' ') => {
-                self.held_jump.press(self.time);
-                self.player.try_jump(&self.world)
+                if self.input_mode == InputMode::Hold {
+                    self.held_jump.press(self.time);
+                }
+                self.player.try_jump(&self.world);
             }
             KeyCode::Left => {
                 self.cursor.0 -= 1;
@@ -414,13 +477,22 @@ impl Game {
                 self.cursor.1 += 1;
                 self.clamp_cursor();
             }
-            KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Enter => self.mine(),
-            KeyCode::Char('z') | KeyCode::Char('Z') | KeyCode::Char('p') => self.place(),
+            KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Enter => {
+                self.mine();
+            }
+            KeyCode::Char('z') | KeyCode::Char('Z') | KeyCode::Char('p') => {
+                self.place();
+            }
             KeyCode::Char('c') | KeyCode::Char('C') => {
+                self.toggle_dir = 0;
                 self.crafting_open = true;
                 self.craft_sel = 0;
             }
+            KeyCode::F(2) | KeyCode::Char('m') | KeyCode::Char('M') => {
+                self.toggle_input_mode();
+            }
             KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') | KeyCode::F(1) => {
+                self.toggle_dir = 0;
                 self.help_open = true;
             }
             KeyCode::Char(ch @ '1'..='9') => {
@@ -458,9 +530,8 @@ impl Game {
         self.time += 1;
 
         // Player movement. In hold mode the held key flags drive movement
-        // continuously; otherwise fall back to a short timer refreshed by
-        // key auto-repeat.
-        if self.hold_mode {
+        // continuously; in toggle mode toggle_dir drives movement.
+        if self.input_mode == InputMode::Hold {
             let trust = self.saw_release;
             let dir = self.held_right.active(self.time, trust) as i32
                 - self.held_left.active(self.time, trust) as i32;
@@ -470,9 +541,10 @@ impl Game {
             if self.held_jump.active(self.time, trust) {
                 self.player.try_jump(&self.world);
             }
-        } else if self.move_timer > 0 {
-            self.move_timer -= 1;
-            self.player.vx = self.move_dir as f32 * 0.55;
+        } else if self.toggle_dir != 0 {
+            self.player.vx = self.toggle_dir as f32 * 0.55;
+        } else {
+            self.player.vx = 0.0;
         }
         if let Some(impact) = self.player.step_physics(&self.world) {
             if impact > SAFE_FALL_VEL {
@@ -655,6 +727,8 @@ impl Game {
             game_over: false,
             map_area: Rect::new(0, 0, 1, 1),
             camera: (0, 0),
+            input_mode: InputMode::Toggle,
+            toggle_dir: 0,
             move_dir: 0,
             move_timer: 0,
             hold_mode: false,
@@ -733,5 +807,28 @@ mod tests {
         assert!(g.daylight() < 0.2);
         g.time = DAY_LEN;
         assert!(g.daylight() > 0.9);
+    }
+
+    #[test]
+    fn test_2d_toggle_mode_movement() {
+        let mut g = Game::new(11);
+        g.set_hold_mode(false);
+        assert_eq!(g.input_mode, InputMode::Toggle);
+
+        // Press 'd' once: begins walking right
+        g.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(g.toggle_dir, 1);
+
+        // Press 'd' again: stops
+        g.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(g.toggle_dir, 0);
+
+        // F2 switches mode
+        g.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        assert_eq!(g.input_mode, InputMode::Hold);
+
+        // 'm' switches back
+        g.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(g.input_mode, InputMode::Toggle);
     }
 }

@@ -194,8 +194,9 @@ pub fn draw(f: &mut Frame, game: &mut Game) {
             area,
             &[
                 ("Movement", ""),
-                ("  a / d", "move left / right"),
+                ("  a / d", if game.input_mode == crate::game::InputMode::Toggle { "toggle walk left / right (opposite stops)" } else { "move left / right (hold)" }),
                 ("  w / space", "jump (swim up in water)"),
+                ("  F2 / m", "switch Hold vs Toggle mode"),
                 ("Actions", ""),
                 ("  arrow keys", "aim the target cursor"),
                 ("  x / Enter / left-click", "mine block / attack zombie"),
@@ -252,6 +253,38 @@ fn draw_hud(f: &mut Frame, game: &Game, area: Rect, hud_h: u16) {
             game.player.x as i32, game.player.y as i32
         )),
     ];
+    match game.input_mode {
+        crate::game::InputMode::Toggle => {
+            spans.push(Span::raw("  "));
+            if game.toggle_dir > 0 {
+                spans.push(Span::styled(
+                    "[WALK ► (A stops)]",
+                    Style::default()
+                        .fg(Color::Rgb(255, 230, 80))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else if game.toggle_dir < 0 {
+                spans.push(Span::styled(
+                    "[WALK ◄ (D stops)]",
+                    Style::default()
+                        .fg(Color::Rgb(255, 230, 80))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    "[Toggle Mode]",
+                    Style::default().fg(Color::Rgb(140, 200, 255)),
+                ));
+            }
+        }
+        crate::game::InputMode::Hold => {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                "[Hold Mode]",
+                Style::default().fg(Color::Rgb(140, 220, 160)),
+            ));
+        }
+    }
     if let Some((m, _)) = &game.msg {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
@@ -311,7 +344,7 @@ fn draw_hud(f: &mut Frame, game: &Game, area: Rect, hud_h: u16) {
     );
 
     // Line 3: help
-    let help = "h help  a/d move  w/space jump  ←↑→↓ aim  x mine  z place  c craft  q quit";
+    let help = "h help  F2 mode  a/d move  w/space jump  ←↑→↓ aim  x mine  z place  c craft  q quit";
     f.render_widget(
         Paragraph::new(help).style(
             Style::default()
