@@ -194,7 +194,7 @@ pub fn draw(f: &mut Frame, game: &mut Game) {
             area,
             &[
                 ("Movement", ""),
-                ("  a / d", if game.input_mode == crate::game::InputMode::Toggle { "toggle walk left / right (opposite stops)" } else { "move left / right (hold)" }),
+                ("  a / d", if game.active_mode() == crate::game::ActiveMode::Toggle { "toggle walk left / right (opposite stops)" } else { "move left / right (hold)" }),
                 ("  w / space", "jump (swim up in water)"),
                 ("  F2 / m", "switch Hold vs Toggle mode"),
                 ("Actions", ""),
@@ -253,37 +253,33 @@ fn draw_hud(f: &mut Frame, game: &Game, area: Rect, hud_h: u16) {
             game.player.x as i32, game.player.y as i32
         )),
     ];
-    match game.input_mode {
-        crate::game::InputMode::Toggle => {
-            spans.push(Span::raw("  "));
-            if game.toggle_dir > 0 {
-                spans.push(Span::styled(
-                    "[WALK ► (A stops)]",
-                    Style::default()
-                        .fg(Color::Rgb(255, 230, 80))
-                        .add_modifier(Modifier::BOLD),
-                ));
-            } else if game.toggle_dir < 0 {
-                spans.push(Span::styled(
-                    "[WALK ◄ (D stops)]",
-                    Style::default()
-                        .fg(Color::Rgb(255, 230, 80))
-                        .add_modifier(Modifier::BOLD),
-                ));
-            } else {
-                spans.push(Span::styled(
-                    "[Toggle Mode]",
-                    Style::default().fg(Color::Rgb(140, 200, 255)),
-                ));
-            }
-        }
-        crate::game::InputMode::Hold => {
-            spans.push(Span::raw("  "));
+    spans.push(Span::raw("  "));
+    if game.active_mode() == crate::game::ActiveMode::Toggle {
+        if game.toggle_dir > 0 {
             spans.push(Span::styled(
-                "[Hold Mode]",
-                Style::default().fg(Color::Rgb(140, 220, 160)),
+                "[WALK ► (A stops)]",
+                Style::default()
+                    .fg(Color::Rgb(255, 230, 80))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if game.toggle_dir < 0 {
+            spans.push(Span::styled(
+                "[WALK ◄ (D stops)]",
+                Style::default()
+                    .fg(Color::Rgb(255, 230, 80))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(
+                format!("[{}]", game.mode_name()),
+                Style::default().fg(Color::Rgb(140, 200, 255)),
             ));
         }
+    } else {
+        spans.push(Span::styled(
+            format!("[{}]", game.mode_name()),
+            Style::default().fg(Color::Rgb(140, 220, 160)),
+        ));
     }
     if let Some((m, _)) = &game.msg {
         spans.push(Span::raw("   "));

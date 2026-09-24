@@ -29,14 +29,16 @@ pub fn poll_stdin(timeout: Duration) -> io::Result<bool> {
 #[derive(Default)]
 pub struct InputReader {
     buf: Vec<u8>,
-    pub supports_release: bool,
+    pub saw_kitty: bool,
+    pub saw_win32: bool,
 }
 
 impl InputReader {
     pub fn new() -> Self {
         Self {
             buf: Vec::with_capacity(1024),
-            supports_release: false,
+            saw_kitty: false,
+            saw_win32: false,
         }
     }
 
@@ -111,8 +113,11 @@ impl InputReader {
 
                         let seq = self.buf.drain(..=end).collect::<Vec<u8>>();
                         if let Some(ev) = parse_csi_sequence(&seq) {
-                            if *seq.last().unwrap_or(&0) == b'_' || *seq.last().unwrap_or(&0) == b'u' {
-                                self.supports_release = true;
+                            let last = *seq.last().unwrap_or(&0);
+                            if last == b'_' {
+                                self.saw_win32 = true;
+                            } else if last == b'u' || seq.windows(2).any(|w| w == b":1" || w == b":2" || w == b":3") {
+                                self.saw_kitty = true;
                             }
                             return Some(ev);
                         }
@@ -343,22 +348,15 @@ fn parse_csi_sequence(seq: &[u8]) -> Option<Event> {
         let first = semi.next()?;
         let second = semi.next();
 
-        let mut colon = first.split(':');
-        let codepoint = colon.next()?.parse::<u32>().ok()?;
-        let kind_code = colon.next().and_then(|k| k.parse::<u8>().ok()).unwrap_or(1);
+        let codepoint = first.split(':').next()?.parse::<u32>().ok()?;
 
-        let modifiers = if let Some(sec) = second {
-            let mod_mask = sec.split(':').next().and_then(|m| m.parse::<u8>().ok()).unwrap_or(1);
-            parse_kitty_modifiers(mod_mask)
+        let (modifiers, kind) = if let Some(sec) = second {
+            let mut sec_parts = sec.split(':');
+            let mod_mask = sec_parts.next().and_then(|m| m.parse::<u8>().ok()).unwrap_or(1);
+            let kind_code = sec_parts.next().and_then(|k| k.parse::<u8>().ok()).unwrap_or(1);
+            (parse_kitty_modifiers(mod_mask), parse_key_event_kind(kind_code))
         } else {
-            KeyModifiers::empty()
-        };
-
-        let kind = match kind_code {
-            1 => KeyEventKind::Press,
-            2 => KeyEventKind::Repeat,
-            3 => KeyEventKind::Release,
-            _ => KeyEventKind::Press,
+            (KeyModifiers::empty(), KeyEventKind::Press)
         };
 
         let keycode = match codepoint {
@@ -399,22 +397,28 @@ fn parse_csi_sequence(seq: &[u8]) -> Option<Event> {
             _ => return None,
         };
         let mut modifiers = KeyModifiers::empty();
+        let mut kind = KeyEventKind::Press;
         if seq.len() > 3 {
             if let Ok(s) = std::str::from_utf8(&seq[2..seq.len() - 1]) {
-                if let Some(mod_str) = s.split(';').nth(1) {
-                    if let Ok(m) = mod_str.parse::<u8>() {
+                if let Some(sec) = s.split(';').nth(1) {
+                    let mut sec_parts = sec.split(':');
+                    if let Some(m) = sec_parts.next().and_then(|m| m.parse::<u8>().ok()) {
                         modifiers = parse_kitty_modifiers(m);
+                    }
+                    if let Some(k) = sec_parts.next().and_then(|k| k.parse::<u8>().ok()) {
+                        kind = parse_key_event_kind(k);
                     }
                 }
             }
         }
-        return Some(Event::Key(KeyEvent::new(code, modifiers)));
+        return Some(Event::Key(KeyEvent::new_with_kind(code, modifiers, kind)));
     }
 
     // 5. Special ANSI ~ sequences: \x1b[<num>~
     if last == b'~' {
         let content = std::str::from_utf8(&seq[2..seq.len() - 1]).ok()?;
-        let num = content.split(';').next()?.parse::<u8>().ok()?;
+        let mut semi = content.split(';');
+        let num = semi.next()?.parse::<u8>().ok()?;
         let code = match num {
             1 | 7 => KeyCode::Home,
             2 => KeyCode::Insert,
@@ -429,10 +433,30 @@ fn parse_csi_sequence(seq: &[u8]) -> Option<Event> {
             31..=34 => KeyCode::F(num - 17),
             _ => return None,
         };
-        return Some(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        let mut modifiers = KeyModifiers::empty();
+        let mut kind = KeyEventKind::Press;
+        if let Some(sec) = semi.next() {
+            let mut sec_parts = sec.split(':');
+            if let Some(m) = sec_parts.next().and_then(|m| m.parse::<u8>().ok()) {
+                modifiers = parse_kitty_modifiers(m);
+            }
+            if let Some(k) = sec_parts.next().and_then(|k| k.parse::<u8>().ok()) {
+                kind = parse_key_event_kind(k);
+            }
+        }
+        return Some(Event::Key(KeyEvent::new_with_kind(code, modifiers, kind)));
     }
 
     None
+}
+
+fn parse_key_event_kind(code: u8) -> KeyEventKind {
+    match code {
+        1 => KeyEventKind::Press,
+        2 => KeyEventKind::Repeat,
+        3 => KeyEventKind::Release,
+        _ => KeyEventKind::Press,
+    }
 }
 
 fn parse_kitty_modifiers(mask: u8) -> KeyModifiers {
@@ -538,24 +562,87 @@ mod tests {
         assert_eq!(r.next_event(), Some(Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))));
         assert_eq!(r.next_event(), Some(Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))));
         assert_eq!(r.next_event(), Some(Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))));
-        assert!(!r.supports_release);
+        assert!(!r.saw_kitty);
+        assert!(!r.saw_win32);
     }
 
     #[test]
-    fn test_win32_sets_supports_release() {
+    fn test_win32_sets_saw_win32() {
         let mut r = InputReader::new();
-        assert!(!r.supports_release);
+        assert!(!r.saw_win32);
         r.feed(b"\x1b[87;17;119;1;0;1_");
         let _ = r.next_event();
-        assert!(r.supports_release);
+        assert!(r.saw_win32);
+        assert!(!r.saw_kitty);
     }
 
     #[test]
-    fn test_kitty_sets_supports_release() {
+    fn test_kitty_sets_saw_kitty() {
         let mut r = InputReader::new();
-        assert!(!r.supports_release);
+        assert!(!r.saw_kitty);
         r.feed(b"\x1b[119;1u");
         let _ = r.next_event();
-        assert!(r.supports_release);
+        assert!(r.saw_kitty);
+        assert!(!r.saw_win32);
+    }
+
+    #[test]
+    fn test_kitty_keypress_and_release_w() {
+        let mut r = InputReader::new();
+        // Press 'w': \x1b[119;1:1u, Release 'w': \x1b[119;1:3u
+        r.feed(b"\x1b[119;1:1u\x1b[119;1:3u");
+        let ev1 = r.next_event().expect("first event");
+        if let Event::Key(k) = ev1 {
+            assert_eq!(k.code, KeyCode::Char('w'));
+            assert_eq!(k.kind, KeyEventKind::Press);
+        } else {
+            panic!("expected Key event");
+        }
+
+        let ev2 = r.next_event().expect("second event");
+        if let Event::Key(k) = ev2 {
+            assert_eq!(k.code, KeyCode::Char('w'));
+            assert_eq!(k.kind, KeyEventKind::Release);
+        } else {
+            panic!("expected Key event");
+        }
+    }
+
+    #[test]
+    fn test_kitty_arrow_press_and_release() {
+        let mut r = InputReader::new();
+        // Press Left: \x1b[1;1:1D, Release Left: \x1b[1;1:3D
+        r.feed(b"\x1b[1;1:1D\x1b[1;1:3D");
+        let ev1 = r.next_event().expect("first event");
+        if let Event::Key(k) = ev1 {
+            assert_eq!(k.code, KeyCode::Left);
+            assert_eq!(k.kind, KeyEventKind::Press);
+        } else {
+            panic!("expected Key event");
+        }
+
+        let ev2 = r.next_event().expect("second event");
+        if let Event::Key(k) = ev2 {
+            assert_eq!(k.code, KeyCode::Left);
+            assert_eq!(k.kind, KeyEventKind::Release);
+        } else {
+            panic!("expected Key event");
+        }
+        assert!(r.saw_kitty);
+    }
+
+    #[test]
+    fn test_kitty_delete_release() {
+        let mut r = InputReader::new();
+        // Delete Release: \x1b[3;1:3~
+        r.feed(b"\x1b[3;1:3~");
+        let ev = r.next_event().expect("delete release");
+        if let Event::Key(k) = ev {
+            assert_eq!(k.code, KeyCode::Delete);
+            assert_eq!(k.kind, KeyEventKind::Release);
+        } else {
+            panic!("expected Key event");
+        }
+        assert!(r.saw_kitty);
     }
 }

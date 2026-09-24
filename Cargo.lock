@@ -538,6 +538,7 @@ name = "termcraft-3d"
 version = "0.3.0"
 dependencies = [
  "crossterm",
+ "libc",
  "rand",
  "ratatui",
  "serde",

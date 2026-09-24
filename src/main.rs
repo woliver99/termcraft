@@ -25,7 +25,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use game::Game;
-use game3::Game3;
+use game3::{Game3, InputMode};
 use net::{Net, NetOpts};
 use world3::{D3, H3, W3};
 
@@ -284,6 +284,15 @@ fn setup_terminal() -> io::Result<(Terminal<CrosstermBackend<io::Stdout>>, bool)
         let _ = io::stdout().flush();
     }
     let enhanced = supports_keyboard_enhancement().unwrap_or(false);
+
+    // Drain any leftover terminal query responses (such as Primary Device Attributes \x1b[?61;...c
+    // sent by Windows Terminal) so they aren't parsed as keystrokes when the game loop starts.
+    let mut drain_buf = [0u8; 1024];
+    while input::poll_stdin(Duration::from_millis(30)).unwrap_or(false) {
+        use std::io::Read;
+        let _ = io::stdin().read(&mut drain_buf);
+    }
+
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -308,11 +317,17 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, game: &mut Game) -
         if input::poll_stdin(timeout)? {
             reader.read_available()?;
             while let Some(ev) = reader.next_event() {
-                if !auto_promoted && reader.supports_release {
+                if reader.saw_kitty && !game.saw_kitty {
+                    game.saw_kitty = true;
+                }
+                if reader.saw_win32 && !game.saw_win32 {
+                    game.saw_win32 = true;
+                }
+                if !auto_promoted && (reader.saw_kitty || reader.saw_win32) {
                     auto_promoted = true;
-                    if !game.is_hold_mode() {
-                        game.set_hold_mode(true);
-                        game.say("Release events detected: Hold Mode enabled!");
+                    if game.input_mode == InputMode::Auto {
+                        let label = if reader.saw_win32 { "Win32" } else { "Kitty" };
+                        game.say(&format!("{label} input detected: Auto Hold Mode active!"));
                     }
                 }
                 match ev {
@@ -345,11 +360,17 @@ fn run3(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, game: &mut Game3)
         if input::poll_stdin(timeout)? {
             reader.read_available()?;
             while let Some(ev) = reader.next_event() {
-                if !auto_promoted && reader.supports_release {
+                if reader.saw_kitty && !game.saw_kitty {
+                    game.saw_kitty = true;
+                }
+                if reader.saw_win32 && !game.saw_win32 {
+                    game.saw_win32 = true;
+                }
+                if !auto_promoted && (reader.saw_kitty || reader.saw_win32) {
                     auto_promoted = true;
-                    if !game.is_hold_mode() {
-                        game.set_hold_mode(true);
-                        game.say("Release events detected: Hold Mode enabled!");
+                    if game.input_mode == InputMode::Auto {
+                        let label = if reader.saw_win32 { "Win32" } else { "Kitty" };
+                        game.say(&format!("{label} input detected: Auto Hold Mode active!"));
                     }
                 }
                 match ev {

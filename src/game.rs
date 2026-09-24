@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::block::Block;
 use crate::entity::{Entity, SAFE_FALL_VEL};
-pub use crate::game3::InputMode;
+pub use crate::game3::{ActiveMode, InputMode};
 use crate::world::{World, SEA_LEVEL, WORLD_H, WORLD_W};
 
 pub const DAY_LEN: u64 = 2400; // ticks per day (2 minutes at 20 TPS)
@@ -54,33 +54,24 @@ pub const RECIPES: &[Recipe] = &[
     },
 ];
 
-/// How long (in ticks) a key press counts as "held" when we can't trust
-/// release events (key auto-repeat refreshes it while genuinely held).
-pub const HOLD_GRACE_TICKS: u64 = 10;
-pub const MOVE_REPEAT_TICKS: u32 = 8;
-
-/// Tracks a possibly-held key. Some terminals claim kitty keyboard support
-/// but never deliver release events, which would leave a naive flag stuck
-/// forever. Until a real release event is observed, a hold only stays
-/// active for a short grace period after the last press/repeat.
+/// Tracks a held key in Hold Mode (Kitty / Windows Terminal).
+/// Activates on KeyPress, deactivates immediately on KeyRelease.
 #[derive(Clone, Copy, Default)]
 pub struct KeyHold {
     down: bool,
-    last_seen: u64,
 }
 
 impl KeyHold {
-    pub fn press(&mut self, now: u64) {
+    pub fn press(&mut self) {
         self.down = true;
-        self.last_seen = now;
     }
 
     pub fn release(&mut self) {
         self.down = false;
     }
 
-    pub fn active(&self, now: u64, trust_releases: bool) -> bool {
-        self.down && (trust_releases || now.saturating_sub(self.last_seen) <= HOLD_GRACE_TICKS)
+    pub fn is_down(&self) -> bool {
+        self.down
     }
 }
 
@@ -104,17 +95,12 @@ pub struct Game {
     pub camera: (i32, i32),
     pub input_mode: InputMode,
     pub toggle_dir: i32,
-    move_dir: i32,
-    move_timer: u32,
-    /// True when the terminal reports key release events (kitty protocol),
-    /// enabling continuous hold-to-move instead of per-keypress nudges.
-    hold_mode: bool,
+    pub saw_kitty: bool,
+    pub saw_win32: bool,
+    pub kitty_supported: bool,
     held_left: KeyHold,
     held_right: KeyHold,
     held_jump: KeyHold,
-    /// Set once any key release event arrives, proving the terminal
-    /// actually reports them.
-    saw_release: bool,
     last_damage_tick: u64,
     zombie_hit_cooldown: u64,
     rng: StdRng,
@@ -143,15 +129,14 @@ impl Game {
             game_over: false,
             map_area: Rect::new(0, 0, 1, 1),
             camera: (0, 0),
-            input_mode: InputMode::Toggle,
+            input_mode: InputMode::Auto,
             toggle_dir: 0,
-            move_dir: 0,
-            move_timer: 0,
-            hold_mode: false,
+            saw_kitty: false,
+            saw_win32: false,
+            kitty_supported: false,
             held_left: KeyHold::default(),
             held_right: KeyHold::default(),
             held_jump: KeyHold::default(),
-            saw_release: false,
             last_damage_tick: 0,
             zombie_hit_cooldown: 0,
             rng: StdRng::seed_from_u64(seed ^ 0xC0FFEE),
@@ -164,33 +149,65 @@ impl Game {
         self.msg = Some((s.to_string(), self.time + 80));
     }
 
+    pub fn active_mode(&self) -> ActiveMode {
+        match self.input_mode {
+            InputMode::Auto => {
+                if self.saw_kitty || self.kitty_supported || self.saw_win32 {
+                    ActiveMode::Hold
+                } else {
+                    ActiveMode::Toggle
+                }
+            }
+            InputMode::Toggle => ActiveMode::Toggle,
+            InputMode::HoldKitty => ActiveMode::Hold,
+            InputMode::HoldWindows => ActiveMode::Hold,
+        }
+    }
+
+    pub fn mode_name(&self) -> &'static str {
+        match self.input_mode {
+            InputMode::Auto => match self.active_mode() {
+                ActiveMode::Hold if self.saw_win32 => "Auto: Hold (Win32)",
+                ActiveMode::Hold => "Auto: Hold (Kitty)",
+                ActiveMode::Toggle => "Auto: Toggle",
+            },
+            InputMode::Toggle => "Toggle Mode",
+            InputMode::HoldKitty => "Hold: Kitty",
+            InputMode::HoldWindows => "Hold: Win32",
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn is_hold_mode(&self) -> bool {
-        self.hold_mode
+        self.active_mode() == ActiveMode::Hold
+    }
+
+    #[allow(dead_code)]
+    pub fn set_kitty_supported(&mut self, on: bool) {
+        self.kitty_supported = on;
     }
 
     pub fn set_hold_mode(&mut self, on: bool) {
-        self.hold_mode = on;
-        self.input_mode = if on {
-            InputMode::Hold
-        } else {
-            InputMode::Toggle
-        };
+        self.kitty_supported = on;
+        if !on {
+            self.input_mode = InputMode::Toggle;
+        } else if self.input_mode == InputMode::Toggle {
+            self.input_mode = InputMode::Auto;
+        }
     }
 
     pub fn toggle_input_mode(&mut self) {
         self.input_mode = match self.input_mode {
-            InputMode::Hold => {
-                self.hold_mode = false;
-                self.say("Input Mode: Toggle (A/D walks, opposite stops)");
-                InputMode::Toggle
-            }
-            InputMode::Toggle => {
-                self.toggle_dir = 0;
-                self.hold_mode = true;
-                self.say("Input Mode: Hold (Hold keys to move)");
-                InputMode::Hold
-            }
+            InputMode::Auto => InputMode::Toggle,
+            InputMode::Toggle => InputMode::HoldKitty,
+            InputMode::HoldKitty => InputMode::HoldWindows,
+            InputMode::HoldWindows => InputMode::Auto,
         };
+        self.held_left.release();
+        self.held_right.release();
+        self.held_jump.release();
+        self.toggle_dir = 0;
+        self.say(&format!("Input Mode: {}", self.mode_name()));
     }
 
     /// 1.0 = full daylight, 0.15 = night.
@@ -364,21 +381,18 @@ impl Game {
 
     pub fn on_key(&mut self, k: KeyEvent) {
         if k.kind == KeyEventKind::Release {
-            // Seeing any release proves the terminal reports them reliably.
-            self.saw_release = true;
-            self.hold_mode = true;
-            if self.input_mode == InputMode::Toggle {
-                self.input_mode = InputMode::Hold;
-                self.toggle_dir = 0;
-                self.say("Key release events detected: Hold Mode enabled!");
+            if self.input_mode == InputMode::Auto && !self.saw_kitty && !self.saw_win32 {
+                self.saw_kitty = true;
             }
-            match k.code {
-                KeyCode::Char('a') | KeyCode::Char('A') => self.held_left.release(),
-                KeyCode::Char('d') | KeyCode::Char('D') => self.held_right.release(),
-                KeyCode::Char('w') | KeyCode::Char('W') | KeyCode::Char(' ') => {
-                    self.held_jump.release()
+            if self.active_mode() == ActiveMode::Hold {
+                match k.code {
+                    KeyCode::Char('a') | KeyCode::Char('A') => self.held_left.release(),
+                    KeyCode::Char('d') | KeyCode::Char('D') => self.held_right.release(),
+                    KeyCode::Char('w') | KeyCode::Char('W') | KeyCode::Char(' ') => {
+                        self.held_jump.release()
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
             return;
         }
@@ -424,44 +438,36 @@ impl Game {
         match k.code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                if self.input_mode == InputMode::Toggle {
-                    if self.toggle_dir < 0 {
-                        self.toggle_dir = 0;
-                        self.say("Stopped.");
-                    } else if self.toggle_dir > 0 {
-                        self.toggle_dir = 0;
-                        self.say("Stopped.");
-                    } else {
-                        self.toggle_dir = -1;
-                        self.say("Walking left (press D or A to stop)");
-                    }
+                if self.active_mode() == ActiveMode::Hold {
+                    self.held_left.press();
+                } else if self.toggle_dir < 0 {
+                    self.toggle_dir = 0;
+                    self.say("Stopped.");
+                } else if self.toggle_dir > 0 {
+                    self.toggle_dir = 0;
+                    self.say("Stopped.");
                 } else {
-                    self.held_left.press(self.time);
-                    self.move_dir = -1;
-                    self.move_timer = MOVE_REPEAT_TICKS;
+                    self.toggle_dir = -1;
+                    self.say("Walking left (press D or A to stop)");
                 }
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
-                if self.input_mode == InputMode::Toggle {
-                    if self.toggle_dir > 0 {
-                        self.toggle_dir = 0;
-                        self.say("Stopped.");
-                    } else if self.toggle_dir < 0 {
-                        self.toggle_dir = 0;
-                        self.say("Stopped.");
-                    } else {
-                        self.toggle_dir = 1;
-                        self.say("Walking right (press A or D to stop)");
-                    }
+                if self.active_mode() == ActiveMode::Hold {
+                    self.held_right.press();
+                } else if self.toggle_dir > 0 {
+                    self.toggle_dir = 0;
+                    self.say("Stopped.");
+                } else if self.toggle_dir < 0 {
+                    self.toggle_dir = 0;
+                    self.say("Stopped.");
                 } else {
-                    self.held_right.press(self.time);
-                    self.move_dir = 1;
-                    self.move_timer = MOVE_REPEAT_TICKS;
+                    self.toggle_dir = 1;
+                    self.say("Walking right (press A or D to stop)");
                 }
             }
             KeyCode::Char('w') | KeyCode::Char('W') | KeyCode::Char(' ') => {
-                if self.input_mode == InputMode::Hold {
-                    self.held_jump.press(self.time);
+                if self.active_mode() == ActiveMode::Hold {
+                    self.held_jump.press();
                 }
                 self.player.try_jump(&self.world);
             }
@@ -535,14 +541,14 @@ impl Game {
 
         // Player movement. In hold mode the held key flags drive movement
         // continuously; in toggle mode toggle_dir drives movement.
-        if self.input_mode == InputMode::Hold {
-            let trust = self.saw_release;
-            let dir = self.held_right.active(self.time, trust) as i32
-                - self.held_left.active(self.time, trust) as i32;
+        if self.active_mode() == ActiveMode::Hold {
+            let dir = self.held_right.is_down() as i32 - self.held_left.is_down() as i32;
             if dir != 0 {
                 self.player.vx = dir as f32 * 0.55;
+            } else {
+                self.player.vx = 0.0;
             }
-            if self.held_jump.active(self.time, trust) {
+            if self.held_jump.is_down() {
                 self.player.try_jump(&self.world);
             }
         } else if self.toggle_dir != 0 {
@@ -731,15 +737,14 @@ impl Game {
             game_over: false,
             map_area: Rect::new(0, 0, 1, 1),
             camera: (0, 0),
-            input_mode: InputMode::Toggle,
+            input_mode: InputMode::Auto,
             toggle_dir: 0,
-            move_dir: 0,
-            move_timer: 0,
-            hold_mode: false,
+            saw_kitty: false,
+            saw_win32: false,
+            kitty_supported: false,
             held_left: KeyHold::default(),
             held_right: KeyHold::default(),
             held_jump: KeyHold::default(),
-            saw_release: false,
             last_damage_tick: data.time,
             zombie_hit_cooldown: 0,
             rng: StdRng::seed_from_u64(data.seed ^ data.time),
@@ -827,12 +832,21 @@ mod tests {
         g.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
         assert_eq!(g.toggle_dir, 0);
 
-        // F2 switches mode
+        // Cycle through modes via F2: Toggle -> HoldKitty -> HoldWindows -> Auto -> Toggle
         g.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-        assert_eq!(g.input_mode, InputMode::Hold);
+        assert_eq!(g.input_mode, InputMode::HoldKitty);
+        assert_eq!(g.active_mode(), ActiveMode::Hold);
 
-        // 'm' switches back
+        g.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        assert_eq!(g.input_mode, InputMode::HoldWindows);
+        assert_eq!(g.active_mode(), ActiveMode::Hold);
+
+        g.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        assert_eq!(g.input_mode, InputMode::Auto);
+
+        // 'm' switches from Auto to Toggle
         g.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
         assert_eq!(g.input_mode, InputMode::Toggle);
+        assert_eq!(g.active_mode(), ActiveMode::Toggle);
     }
 }
