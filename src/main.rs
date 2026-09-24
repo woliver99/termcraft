@@ -180,7 +180,10 @@ fn main() -> io::Result<()> {
             Game::load().unwrap_or_else(|| Game::new(default_seed()))
         };
         let (mut terminal, hold_keys) = setup_terminal()?;
-        game.set_hold_mode(hold_keys);
+        game.kitty_supported = hold_keys;
+        if std::env::var_os("WT_SESSION").is_some() {
+            game.saw_win32 = true;
+        }
         let result = run(&mut terminal, &mut game);
         restore_terminal();
         match game.save() {
@@ -214,7 +217,10 @@ fn main() -> io::Result<()> {
             game.set_creative(true);
         }
         let (mut terminal, hold_keys) = setup_terminal()?;
-        game.set_hold_mode(hold_keys);
+        game.kitty_supported = hold_keys;
+        if std::env::var_os("WT_SESSION").is_some() {
+            game.saw_win32 = true;
+        }
         let result = run3(&mut terminal, &mut game);
         restore_terminal();
         let _ = game.save_player();

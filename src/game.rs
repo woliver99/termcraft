@@ -166,11 +166,17 @@ impl Game {
 
     pub fn mode_name(&self) -> &'static str {
         match self.input_mode {
-            InputMode::Auto => match self.active_mode() {
-                ActiveMode::Hold if self.saw_win32 => "Auto: Hold (Win32)",
-                ActiveMode::Hold => "Auto: Hold (Kitty)",
-                ActiveMode::Toggle => "Auto: Toggle",
-            },
+            InputMode::Auto => {
+                if !self.saw_kitty && !self.saw_win32 && !self.kitty_supported {
+                    "Auto"
+                } else {
+                    match self.active_mode() {
+                        ActiveMode::Hold if self.saw_win32 => "Auto: Hold (Win32)",
+                        ActiveMode::Hold => "Auto: Hold (Kitty)",
+                        ActiveMode::Toggle => "Auto: Toggle",
+                    }
+                }
+            }
             InputMode::Toggle => "Toggle Mode",
             InputMode::HoldKitty => "Hold: Kitty",
             InputMode::HoldWindows => "Hold: Win32",
@@ -187,6 +193,7 @@ impl Game {
         self.kitty_supported = on;
     }
 
+    #[allow(dead_code)]
     pub fn set_hold_mode(&mut self, on: bool) {
         self.kitty_supported = on;
         if !on {
@@ -816,6 +823,31 @@ mod tests {
         assert!(g.daylight() < 0.2);
         g.time = DAY_LEN;
         assert!(g.daylight() > 0.9);
+    }
+
+    #[test]
+    fn test_2d_game_starts_in_auto_mode() {
+        let g = Game::new(11);
+        assert_eq!(g.input_mode, InputMode::Auto);
+        assert_eq!(g.mode_name(), "Auto");
+    }
+
+    #[test]
+    fn test_2d_auto_mode_switches_to_win32_hold_on_win32_flag() {
+        let mut g = Game::new(11);
+        assert_eq!(g.input_mode, InputMode::Auto);
+        g.saw_win32 = true;
+        assert_eq!(g.active_mode(), ActiveMode::Hold);
+        assert_eq!(g.mode_name(), "Auto: Hold (Win32)");
+    }
+
+    #[test]
+    fn test_2d_auto_mode_switches_to_kitty_hold_on_kitty_flag() {
+        let mut g = Game::new(11);
+        assert_eq!(g.input_mode, InputMode::Auto);
+        g.kitty_supported = true;
+        assert_eq!(g.active_mode(), ActiveMode::Hold);
+        assert_eq!(g.mode_name(), "Auto: Hold (Kitty)");
     }
 
     #[test]

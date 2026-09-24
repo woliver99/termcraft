@@ -364,11 +364,17 @@ impl Game3 {
 
     pub fn mode_name(&self) -> &'static str {
         match self.input_mode {
-            InputMode::Auto => match self.active_mode() {
-                ActiveMode::Hold if self.saw_win32 => "Auto: Hold (Win32)",
-                ActiveMode::Hold => "Auto: Hold (Kitty)",
-                ActiveMode::Toggle => "Auto: Toggle",
-            },
+            InputMode::Auto => {
+                if !self.saw_kitty && !self.saw_win32 && !self.kitty_supported {
+                    "Auto"
+                } else {
+                    match self.active_mode() {
+                        ActiveMode::Hold if self.saw_win32 => "Auto: Hold (Win32)",
+                        ActiveMode::Hold => "Auto: Hold (Kitty)",
+                        ActiveMode::Toggle => "Auto: Toggle",
+                    }
+                }
+            }
             InputMode::Toggle => "Toggle Mode",
             InputMode::HoldKitty => "Hold: Kitty",
             InputMode::HoldWindows => "Hold: Win32",
@@ -385,6 +391,7 @@ impl Game3 {
         self.kitty_supported = on;
     }
 
+    #[allow(dead_code)]
     pub fn set_hold_mode(&mut self, on: bool) {
         self.kitty_supported = on;
         if !on {
@@ -2326,6 +2333,31 @@ mod tests {
         let moved = (g.px - start_pos.0).hypot(g.pz - start_pos.1);
         assert!(moved > 0.5, "player should move forward, moved {moved}");
         assert!(g.yaw < -0.5, "camera should turn left, yaw is {}", g.yaw);
+    }
+
+    #[test]
+    fn test_game_starts_in_auto_mode() {
+        let g = Game3::new(9);
+        assert_eq!(g.input_mode, InputMode::Auto);
+        assert_eq!(g.mode_name(), "Auto");
+    }
+
+    #[test]
+    fn test_auto_mode_switches_to_win32_hold_on_win32_flag() {
+        let mut g = Game3::new(9);
+        assert_eq!(g.input_mode, InputMode::Auto);
+        g.saw_win32 = true;
+        assert_eq!(g.active_mode(), ActiveMode::Hold);
+        assert_eq!(g.mode_name(), "Auto: Hold (Win32)");
+    }
+
+    #[test]
+    fn test_auto_mode_switches_to_kitty_hold_on_kitty_flag() {
+        let mut g = Game3::new(9);
+        assert_eq!(g.input_mode, InputMode::Auto);
+        g.kitty_supported = true;
+        assert_eq!(g.active_mode(), ActiveMode::Hold);
+        assert_eq!(g.mode_name(), "Auto: Hold (Kitty)");
     }
 
     #[test]
