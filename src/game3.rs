@@ -352,6 +352,10 @@ impl Game3 {
         self.msg = Some((s.to_string(), self.time + 80));
     }
 
+    pub fn is_hold_mode(&self) -> bool {
+        self.hold_mode
+    }
+
     pub fn set_hold_mode(&mut self, on: bool) {
         self.hold_mode = on;
         self.input_mode = if on {
@@ -978,7 +982,7 @@ impl Game3 {
             if self.input_mode == InputMode::Toggle {
                 self.input_mode = InputMode::Hold;
                 self.stop_toggle_motion();
-                self.say("Kitty Keyboard Protocol detected: Hold Mode enabled!");
+                self.say("Key release events detected: Hold Mode enabled!");
             }
             match k.code {
                 KeyCode::Char('w') | KeyCode::Char('W') => self.held_w.release(),

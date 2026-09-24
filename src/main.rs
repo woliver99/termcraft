@@ -2,6 +2,7 @@ mod block;
 mod entity;
 mod game;
 mod game3;
+mod input;
 mod net;
 mod render;
 mod render3;
@@ -12,7 +13,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
@@ -105,9 +106,13 @@ fn restore_terminal() {
         LeaveAlternateScreen,
         DisableMouseCapture
     );
-    if std::env::var_os("TMUX").is_some() {
+    {
         use std::io::Write;
-        let _ = io::stdout().write_all(b"\x1bPtmux;\x1b\x1b[<u\x1b\\");
+        let _ = io::stdout().write_all(b"\x1b[?9001l");
+        if std::env::var_os("TMUX").is_some() {
+            let _ = io::stdout().write_all(b"\x1bPtmux;\x1b\x1b[<u\x1b\\");
+            let _ = io::stdout().write_all(b"\x1bPtmux;\x1b\x1b[?9001l\x1b\\");
+        }
         let _ = io::stdout().flush();
     }
     let _ = disable_raw_mode();
@@ -266,12 +271,18 @@ fn setup_terminal() -> io::Result<(Terminal<CrosstermBackend<io::Stdout>>, bool)
     if std::env::var_os("TMUX").is_some() {
         use std::io::Write;
         let _ = io::stdout().write_all(b"\x1bPtmux;\x1b\x1b[>1u\x1b\\");
+        let _ = io::stdout().write_all(b"\x1bPtmux;\x1b\x1b[?9001h\x1b\\");
         let _ = io::stdout().flush();
     }
     let _ = execute!(
         io::stdout(),
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
     );
+    {
+        use std::io::Write;
+        let _ = io::stdout().write_all(b"\x1b[?9001h");
+        let _ = io::stdout().flush();
+    }
     let enhanced = supports_keyboard_enhancement().unwrap_or(false);
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -287,21 +298,27 @@ fn default_seed() -> u64 {
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, game: &mut Game) -> io::Result<()> {
+    let mut reader = input::InputReader::new();
+    let mut auto_promoted = false;
     let mut last_tick = Instant::now();
     loop {
         terminal.draw(|f| render::draw(f, game))?;
 
         let timeout = TICK.saturating_sub(last_tick.elapsed());
-        if event::poll(timeout)? {
-            // Drain everything that's queued so multi-key input stays responsive.
-            loop {
-                match event::read()? {
+        if input::poll_stdin(timeout)? {
+            reader.read_available()?;
+            while let Some(ev) = reader.next_event() {
+                if !auto_promoted && reader.supports_release {
+                    auto_promoted = true;
+                    if !game.is_hold_mode() {
+                        game.set_hold_mode(true);
+                        game.say("Release events detected: Hold Mode enabled!");
+                    }
+                }
+                match ev {
                     Event::Key(k) => game.on_key(k),
                     Event::Mouse(m) => game.on_mouse(m),
                     _ => {}
-                }
-                if !event::poll(Duration::ZERO)? {
-                    break;
                 }
             }
         }
@@ -318,20 +335,27 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, game: &mut Game) -
 }
 
 fn run3(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, game: &mut Game3) -> io::Result<()> {
+    let mut reader = input::InputReader::new();
+    let mut auto_promoted = false;
     let mut last_tick = Instant::now();
     loop {
         terminal.draw(|f| render3::draw(f, game))?;
 
         let timeout = TICK.saturating_sub(last_tick.elapsed());
-        if event::poll(timeout)? {
-            loop {
-                match event::read()? {
+        if input::poll_stdin(timeout)? {
+            reader.read_available()?;
+            while let Some(ev) = reader.next_event() {
+                if !auto_promoted && reader.supports_release {
+                    auto_promoted = true;
+                    if !game.is_hold_mode() {
+                        game.set_hold_mode(true);
+                        game.say("Release events detected: Hold Mode enabled!");
+                    }
+                }
+                match ev {
                     Event::Key(k) => game.on_key(k),
                     Event::Mouse(m) => game.on_mouse(m),
                     _ => {}
-                }
-                if !event::poll(Duration::ZERO)? {
-                    break;
                 }
             }
         }
@@ -420,8 +444,14 @@ fn run_diagnostics() -> io::Result<()> {
         let slice = &buf[..n];
         let elapsed = format!("+{}ms", start_time.elapsed().as_millis());
 
-        // Check if exit
-        if slice == b"q" || slice == b"Q" || slice == b"\x1b" || slice == b"\x03" {
+        // Check if exit (q, Q, Esc, Ctrl+C in raw, ANSI, or Win32 format)
+        let is_exit = slice == b"q"
+            || slice == b"Q"
+            || slice == b"\x1b"
+            || slice.contains(&0x03)
+            || slice.starts_with(b"\x1b[81;") // Win32 Vk=81 ('Q')
+            || slice.starts_with(b"\x1b[27;"); // Win32 Vk=27 (Esc)
+        if is_exit {
             break;
         }
 
