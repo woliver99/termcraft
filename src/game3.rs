@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::block::Block;
 use crate::game::{KeyHold, DAY_LEN, PLAYER_MAX_HP, RECIPES};
 use crate::net::{Net, NetEvent, Peer, PlayerId, PlayerState, Role};
-use crate::world3::{World3, H3};
+use crate::world3::{World3, D3, H3, W3};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MigrationResult {
@@ -858,15 +858,29 @@ impl Game3 {
         };
         if !hit.block.is_minable() {
             if hit.block == Block::Bedrock {
-                self.say("Bedrock is unbreakable.");
+                if self.creative {
+                    if !(0..W3).contains(&hit.x)
+                        || !(0..D3).contains(&hit.z)
+                        || !(0..H3).contains(&hit.y)
+                    {
+                        self.say("World boundary cannot be broken.");
+                        return;
+                    }
+                } else {
+                    self.say("Bedrock is unbreakable.");
+                    return;
+                }
+            } else {
+                return;
             }
-            return;
         }
         self.set_block_synced(hit.x, hit.y, hit.z, Block::Air);
-        if let Some(drop) = hit.block.drops() {
-            self.add_item(drop, 1);
-            let m = format!("+1 {}", drop.name());
-            self.say(&m);
+        if !self.creative {
+            if let Some(drop) = hit.block.drops() {
+                self.add_item(drop, 1);
+                let m = format!("+1 {}", drop.name());
+                self.say(&m);
+            }
         }
     }
 
@@ -2615,5 +2629,66 @@ mod tests {
         assert_eq!(g.look_yaw, 0.0);
         assert_eq!(g.look_pitch, 0.0);
         assert!(g.inventory_open);
+    }
+
+    #[test]
+    fn test_creative_mode_breaks_blocks_without_adding_to_inventory() {
+        let mut g = Game3::new(9);
+        for _ in 0..100 {
+            g.tick(); // settle
+        }
+        g.set_creative(true);
+        g.pitch = -1.2; // look down
+        let before = g.target().expect("looking at ground");
+        assert_ne!(before.block, Block::Air);
+        g.mine();
+        assert_eq!(g.world.get(before.x, before.y, before.z), Block::Air);
+        assert!(g.inv.is_empty(), "inventory should remain empty in creative mode");
+    }
+
+    #[test]
+    fn test_creative_mode_can_break_placed_and_natural_bedrock() {
+        let mut g = Game3::new(9);
+        let (sx, sy, sz) = g.world.spawn;
+        let (bx, by, bz) = (sx as i32, sy as i32 + 5, sz as i32);
+        g.world.set(bx, by, bz, Block::Bedrock);
+        g.px = bx as f32 + 0.5;
+        g.py = by as f32 + 1.0;
+        g.pz = bz as f32 + 0.5;
+        g.pitch = -1.5; // look straight down at (bx, by, bz)
+        let target = g.target().expect("aiming at bedrock block");
+        assert_eq!(target.block, Block::Bedrock);
+        assert_eq!((target.x, target.y, target.z), (bx, by, bz));
+
+        // 1. Survival mode cannot break bedrock
+        g.set_creative(false);
+        g.mine();
+        assert_eq!(g.world.get(bx, by, bz), Block::Bedrock);
+        assert_eq!(g.msg.as_ref().map(|(s, _)| s.as_str()), Some("Bedrock is unbreakable."));
+
+        // 2. Creative mode can break bedrock within world bounds
+        g.set_creative(true);
+        g.mine();
+        assert_eq!(g.world.get(bx, by, bz), Block::Air);
+        assert!(g.inv.is_empty(), "creative mode should not collect broken bedrock into inventory");
+    }
+
+    #[test]
+    fn test_creative_mode_cannot_break_world_boundary() {
+        let mut g = Game3::new(9);
+        g.set_creative(true);
+        // Stand near x = 0 looking negative X (towards world border)
+        g.px = 0.5;
+        g.py = 10.0;
+        g.pz = 10.5;
+        g.yaw = std::f32::consts::PI;
+        g.pitch = 0.0;
+        let target = g.target().expect("aiming at boundary");
+        assert!(target.x < 0, "target should be beyond world bounds");
+        assert_eq!(target.block, Block::Bedrock);
+
+        g.mine();
+        assert_eq!(g.world.get(target.x, target.y, target.z), Block::Bedrock);
+        assert_eq!(g.msg.as_ref().map(|(s, _)| s.as_str()), Some("World boundary cannot be broken."));
     }
 }
